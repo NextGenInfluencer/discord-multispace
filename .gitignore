@@ -23,3 +23,8 @@ desktop.ini
 # Temporary files
 scratch/
 tmp/
+
+# Build and dist outputs
+dist/
+out/
+build/
