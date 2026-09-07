@@ -27,14 +27,14 @@ async function handleDisplayMediaRequest(request, callback) {
 
     if (!sources || sources.length === 0) {
       log(`No display sources found for request [${requestId}]`);
-      callback({ video: null });
+      callback({});
       return;
     }
 
     // Cancel any previous pending requests cleanly
     for (const [oldId, oldReq] of pendingDisplayMediaRequests.entries()) {
       try {
-        oldReq.callback({ video: null });
+        oldReq.callback({});
       } catch {}
       pendingDisplayMediaRequests.delete(oldId);
     }
@@ -78,13 +78,13 @@ async function handleDisplayMediaRequest(request, callback) {
       mainWindow.focus();
       mainWindow.webContents.send('open-screen-picker', { requestId, sources: serializedSources });
     } else {
-      callback({ video: null });
+      callback({});
       pendingDisplayMediaRequests.delete(requestId);
     }
   } catch (err) {
     log(`Display media request handler error: ${err.stack || err}`);
     try {
-      callback({ video: null });
+      callback({});
     } catch {}
   }
 }
@@ -649,13 +649,13 @@ ipcMain.on('screen-picker-select', (event, { requestId, sourceId, withAudio }) =
     } catch (err) {
       log(`Error calling display media callback: ${err.stack || err}`);
       try {
-        pending.callback({ video: null });
+        pending.callback({});
       } catch {}
     }
   } else {
     log(`Selected source [${sourceId}] not found in available sources`);
     try {
-      pending.callback({ video: null });
+      pending.callback({});
     } catch {}
   }
 });
@@ -667,7 +667,7 @@ ipcMain.on('screen-picker-cancel', (event, { requestId }) => {
     pendingDisplayMediaRequests.delete(requestId);
     log(`Screen share cancelled by user for request [${requestId}]`);
     try {
-      pending.callback({ video: null });
+      pending.callback({});
     } catch (err) {
       log(`Error cancelling display media callback: ${err}`);
     }
