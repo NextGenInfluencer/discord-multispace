@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self';">
+  <title>Discord MultiSpace</title>
+  <!-- Google Fonts for modern typography -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app-container">
+    <!-- Left Navigation Sidebar -->
+    <nav id="sidebar">
+      <!-- App Header / Master Brand Icon -->
+      <div class="sidebar-header" title="Discord MultiSpace">
+        <div class="app-logo">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+            <path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994.021-.041.001-.09-.041-.106a13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.929 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.893.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z" fill="white"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="sidebar-separator"></div>
+
+      <!-- Account Badge Stack -->
+      <div id="account-stack" class="account-stack">
+        <!-- Rendered dynamically by renderer.js -->
+      </div>
+
+      <!-- Add Account Button -->
+      <div class="add-account-wrapper">
+        <div class="account-item action-item" id="btn-add-account" title="Add Account">
+          <div class="indicator-pill"></div>
+          <button class="account-badge action-badge" aria-label="Add Discord Account">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="12" y1="5" x2="12" y2="19"></line>
+              <line x1="5" y1="12" x2="19" y2="12"></line>
+            </svg>
+          </button>
+          <div class="badge-tooltip">Add an Account</div>
+        </div>
+      </div>
+
+      <!-- Bottom controls (Split view, audio controls, reload, settings) -->
+      <div class="sidebar-footer">
+        <div class="sidebar-separator"></div>
+
+        <!-- Split View Toggle Button -->
+        <div class="account-item action-item" id="btn-split-view" title="Toggle Split View">
+          <div class="indicator-pill"></div>
+          <button class="account-badge action-badge split-badge" aria-label="Toggle Side-by-Side Split View">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+              <line x1="12" y1="3" x2="12" y2="21"></line>
+            </svg>
+          </button>
+          <div class="badge-tooltip">Split View (Side-by-Side)</div>
+        </div>
+
+        <!-- Global Mute & Deafen Quick Actions -->
+        <div class="quick-audio-row">
+          <button class="quick-audio-btn" id="btn-mute-all" title="Mute All (Ctrl+Alt+M)" aria-label="Mute All">
+            <svg class="icon-unmuted" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+              <line x1="12" y1="19" x2="12" y2="23"></line>
+              <line x1="8" y1="23" x2="16" y2="23"></line>
+            </svg>
+            <svg class="icon-muted" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="1" y1="1" x2="23" y2="23"></line>
+              <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"></path>
+              <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"></path>
+              <line x1="12" y1="19" x2="12" y2="23"></line>
+              <line x1="8" y1="23" x2="16" y2="23"></line>
+            </svg>
+          </button>
+          <button class="quick-audio-btn" id="btn-deafen-all" title="Deafen All (Ctrl+Alt+D)" aria-label="Deafen All">
+            <svg class="icon-undeafened" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 18v-6a9 9 0 0 1 18 0v6"></path>
+              <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"></path>
+            </svg>
+            <svg class="icon-deafened" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="1" y1="1" x2="23" y2="23"></line>
+              <path d="M21 15v-3a9 9 0 0 0-15.36-6.36M3 12v6a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3"></path>
+              <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"></path>
+            </svg>
+          </button>
+        </div>
+
+        <div class="account-item action-item" id="btn-reload-active" title="Reload Active Account (F5)">
+          <div class="indicator-pill"></div>
+          <button class="account-badge action-badge reload-badge" aria-label="Reload Active Account">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"></polyline>
+              <polyline points="1 20 1 14 7 14"></polyline>
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+            </svg>
+          </button>
+          <div class="badge-tooltip">
+            <span>Reload Tab</span>
+            <span class="tooltip-subhint">Shift+Click: Reload App</span>
+          </div>
+        </div>
+
+        <!-- Settings & Memory Saver Button -->
+        <div class="account-item action-item" id="btn-open-settings" title="Settings & Memory Saver">
+          <div class="indicator-pill"></div>
+          <button class="account-badge action-badge settings-badge" aria-label="MultiSpace Settings">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+          </button>
+          <div class="badge-tooltip">Settings & Memory Saver</div>
+        </div>
+      </div>
+    </nav>
+
+    <!-- Main Content Container for WebViews -->
+    <main id="content-area">
+      <!-- Split View Header Bar (visible in split mode) -->
+      <div id="split-header" class="split-header hidden">
+        <div class="split-pane-selector">
+          <span class="split-pane-label">Pane 1:</span>
+          <select id="split-select-primary" class="split-select"></select>
+        </div>
+        <div class="split-header-divider"></div>
+        <div class="split-pane-selector">
+          <span class="split-pane-label">Pane 2:</span>
+          <select id="split-select-secondary" class="split-select"></select>
+        </div>
+        <button id="btn-close-split" class="btn-close-split" title="Exit Split View">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+          <span>Exit Split View</span>
+        </button>
+      </div>
+
+      <div id="webview-container">
+        <!-- WebViews inserted and toggled dynamically here -->
+      </div>
+      <div id="webview-loading-bar" class="loading-bar"></div>
+      <div id="zoom-indicator" class="zoom-indicator">Zoom: 100%</div>
+    </main>
+  </div>
+
+  <!-- Custom Sleek Discord-Themed Context Menu -->
+  <div id="context-menu" class="context-menu">
+    <div class="context-menu-header" id="ctx-account-title">Account Options</div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" id="ctx-action-edit">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
+      <span>Edit Account</span>
+    </div>
+    <div class="context-menu-item" id="ctx-action-reload">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+      <span>Reload Session</span>
+    </div>
+    <div class="context-menu-item" id="ctx-action-clear-cache">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"></path><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+      <span>Clear Cache</span>
+    </div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item danger" id="ctx-action-delete">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+      <span>Remove Account</span>
+    </div>
+  </div>
+
+  <!-- Reload Options Context Menu -->
+  <div id="reload-context-menu" class="context-menu">
+    <div class="context-menu-header">Reload Options</div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" id="ctx-reload-tab">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+      <span>Reload Discord Tab</span>
+      <span class="ctx-shortcut">F5</span>
+    </div>
+    <div class="context-menu-item" id="ctx-reload-tab-hard">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
+      <span>Hard Reload Discord</span>
+    </div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" id="ctx-reload-app">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+      <span>Reload MultiSpace App</span>
+      <span class="ctx-shortcut">Ctrl+Shift+R</span>
+    </div>
+  </div>
+
+  <!-- Account Modal (Add / Edit) -->
+  <div id="modal-overlay" class="modal-overlay">
+    <div class="modal-container">
+      <div class="modal-header">
+        <h3 id="modal-title">Add New Account</h3>
+        <p class="modal-subtitle">Each account runs in an independent, isolated session.</p>
+      </div>
+
+      <div class="modal-body">
+        <!-- Avatar Upload Section -->
+        <label class="modal-label">PROFILE PICTURE (AVATAR)</label>
+        <div class="avatar-upload-row">
+          <div class="avatar-preview-box" id="avatar-preview-box" title="Click to select avatar image">
+            <div id="modal-avatar-preview" class="modal-avatar-badge"></div>
+            <div class="avatar-overlay-icon">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg>
+            </div>
+          </div>
+          <div class="avatar-actions">
+            <input type="file" id="input-account-avatar" accept="image/png, image/jpeg, image/webp, image/gif" style="display: none;" />
+            <button type="button" id="btn-upload-avatar" class="btn-secondary-action">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+              <span>Upload Image</span>
+            </button>
+            <button type="button" id="btn-remove-avatar" class="btn-remove-avatar">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+              <span>Remove Avatar</span>
+            </button>
+          </div>
+        </div>
+
+        <label for="input-account-name" class="modal-label" style="margin-top: 18px;">ACCOUNT NAME</label>
+        <input type="text" id="input-account-name" class="modal-input" placeholder="e.g. Airi, Juwon, Work, Personal" maxlength="32" autocomplete="off" />
+
+        <label class="modal-label" style="margin-top: 18px;">ACCENT COLOR (FALLBACK)</label>
+        <div class="color-palette" id="color-palette">
+          <!-- Color choices inserted dynamically -->
+        </div>
+
+        <label for="input-account-proxy" class="modal-label" style="margin-top: 18px;">PROXY SERVER (OPTIONAL)</label>
+        <input type="text" id="input-account-proxy" class="modal-input" placeholder="e.g. http://127.0.0.1:8080 or socks5://127.0.0.1:1080" autocomplete="off" />
+        <span class="modal-input-hint">Leave blank for direct network connection. Supports HTTP, HTTPS, and SOCKS5.</span>
+      </div>
+
+      <div class="modal-footer">
+        <button id="btn-modal-cancel" class="btn-secondary">Cancel</button>
+        <button id="btn-modal-submit" class="btn-primary">Create Account</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings Modal (Memory Saver & Preferences) -->
+  <div id="settings-modal-overlay" class="modal-overlay">
+    <div class="modal-container">
+      <div class="modal-header">
+        <h3>MultiSpace Settings</h3>
+        <p class="modal-subtitle">Performance, audio, and power-user preferences.</p>
+      </div>
+      <div class="modal-body">
+        <div class="settings-toggle-row">
+          <div class="settings-toggle-info">
+            <span class="settings-toggle-title">Background Memory Saver</span>
+            <span class="settings-toggle-desc">Automatically hibernates background accounts idle for &gt;15 minutes (mutes audio and throttles frames unless inside an active voice call). Wakes instantly when clicked.</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="toggle-memory-saver" checked>
+            <span class="slider round"></span>
+          </label>
+        </div>
+
+        <div class="settings-toggle-row" style="margin-top: 14px;">
+          <div class="settings-toggle-info">
+            <span class="settings-toggle-title">Launch on Windows Startup</span>
+            <span class="settings-toggle-desc">Automatically launch Discord MultiSpace minimized in the system tray when your computer starts.</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="toggle-startup">
+            <span class="slider round"></span>
+          </label>
+        </div>
+
+        <div class="settings-toggle-row" style="margin-top: 14px;">
+          <div class="settings-toggle-info">
+            <span class="settings-toggle-title">Show Quick Reload Button</span>
+            <span class="settings-toggle-desc">Display the dedicated 1-click reload icon in the sidebar footer. When turned off, you can still right-click the Settings gear for reload options or press F5 / Ctrl+Shift+R.</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="toggle-show-reload-btn" checked>
+            <span class="slider round"></span>
+          </label>
+        </div>
+
+        <!-- Themes & Appearance Section -->
+        <div class="settings-section-divider"></div>
+        <div class="settings-section-header">
+          <span class="modal-label">THEMES & COMMUNITY SKINS</span>
+          <span id="theme-active-status" class="theme-active-status">Default</span>
+        </div>
+
+        <!-- Community Theme Sources Directory -->
+        <div class="theme-directory-row">
+          <span class="theme-directory-label">Find Community Themes:</span>
+          <div class="theme-links-container">
+            <button type="button" class="theme-source-link" data-url="https://betterdiscord.app/themes" title="Browse BetterDiscord Themes">
+              <span>BetterDiscord</span>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+            </button>
+            <button type="button" class="theme-source-link" data-url="https://themes.equicord.org" title="Browse Equicord Theme Library">
+              <span>Equicord</span>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+            </button>
+            <button type="button" class="theme-source-link" data-url="https://vsthemes.org/en/skins/discord/" title="Browse VSThemes Discord Collection">
+              <span>VSThemes</span>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Quick Presets Grid -->
+        <label class="modal-label" style="margin-top: 14px; margin-bottom: 8px;">1-CLICK QUICK PRESETS</label>
+        <div class="theme-presets-grid">
+          <div class="theme-preset-card active" data-preset="default">
+            <div class="theme-preset-header">
+              <span class="theme-preset-icon">🎨</span>
+              <span class="theme-preset-name">Default Discord</span>
+            </div>
+            <p class="theme-preset-desc">Standard Discord dark theme with clean UI.</p>
+            <div class="theme-preset-badge">Active</div>
+          </div>
+
+          <div class="theme-preset-card" data-preset="midnight">
+            <div class="theme-preset-header">
+              <span class="theme-preset-icon">🌙</span>
+              <span class="theme-preset-name">Midnight Dark</span>
+            </div>
+            <p class="theme-preset-desc">Refined rounded modern dark theme by refact0r.</p>
+            <div class="theme-preset-badge">Active</div>
+          </div>
+
+          <div class="theme-preset-card" data-preset="amoled">
+            <div class="theme-preset-header">
+              <span class="theme-preset-icon">⚡</span>
+              <span class="theme-preset-name">Pitch Black AMOLED</span>
+            </div>
+            <p class="theme-preset-desc">Pure 100% black OLED styling by luckfire.</p>
+            <div class="theme-preset-badge">Active</div>
+          </div>
+
+          <div class="theme-preset-card" data-preset="minimalist">
+            <div class="theme-preset-header">
+              <span class="theme-preset-icon">✨</span>
+              <span class="theme-preset-name">Clean Minimalist</span>
+            </div>
+            <p class="theme-preset-desc">Hides Nitro gift/sticker buttons, 6px sleek scrollbars.</p>
+            <div class="theme-preset-badge">Active</div>
+          </div>
+        </div>
+
+        <!-- Custom Theme / Raw CSS Editor -->
+        <label for="input-theme-css" class="modal-label" style="margin-top: 14px;">CUSTOM THEME URL / RAW CSS</label>
+        <textarea id="input-theme-css" class="theme-css-textarea" placeholder="Paste any @import url(...) link or custom CSS rules here..." rows="3" spellcheck="false"></textarea>
+        <div class="theme-actions-row">
+          <button type="button" id="btn-apply-theme" class="btn-primary btn-theme-apply">Apply Theme</button>
+          <button type="button" id="btn-clear-theme" class="btn-secondary btn-theme-clear">Reset to Default</button>
+        </div>
+
+        <div class="settings-section-divider" style="margin-top: 18px;"></div>
+        <label class="modal-label" style="margin-bottom: 6px;">KEYBOARD SHORTCUTS</label>
+        <div class="settings-shortcuts-list">
+          <div class="settings-shortcut-item">
+            <span class="shortcut-label">Zoom In / Out / Reset</span>
+            <span class="ctx-shortcut">Ctrl + +/-/0</span>
+          </div>
+          <div class="settings-shortcut-item">
+            <span class="shortcut-label">Toggle Mute All</span>
+            <span class="ctx-shortcut">Ctrl + Alt + M</span>
+          </div>
+          <div class="settings-shortcut-item">
+            <span class="shortcut-label">Toggle Deafen All</span>
+            <span class="ctx-shortcut">Ctrl + Alt + D</span>
+          </div>
+          <div class="settings-shortcut-item">
+            <span class="shortcut-label">Emergency Boss Key (Mute & Hide / Restore)</span>
+            <span class="ctx-shortcut">Ctrl + Shift + H</span>
+          </div>
+          <div class="settings-shortcut-item">
+            <span class="shortcut-label">Reload Active Session</span>
+            <span class="ctx-shortcut">F5 / Ctrl + R</span>
+          </div>
+          <div class="settings-shortcut-item">
+            <span class="shortcut-label">Reload App Shell</span>
+            <span class="ctx-shortcut">Ctrl + Shift + R</span>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer" style="display: flex; justify-content: space-between; align-items: center;">
+        <button type="button" id="btn-settings-force-reload" class="btn-secondary" style="font-size: 12px; padding: 7px 12px; display: inline-flex; align-items: center; gap: 6px;" title="Force Reload MultiSpace App (Ctrl+Shift+R)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+          <span>Force Reload App</span>
+        </button>
+        <button id="btn-settings-close" class="btn-primary">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Floating Toast Notifications -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
