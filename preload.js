@@ -17,7 +17,9 @@ const ALLOWED_SEND_CHANNELS = [
   'set-account-proxy',
   'app-reload-window',
   'clear-account-cache',
-  'set-startup-setting'
+  'set-startup-setting',
+  'screen-picker-select',
+  'screen-picker-cancel'
 ];
 
 // Whitelist of IPC channels the renderer is allowed to invoke (request/response)
@@ -33,7 +35,9 @@ const ALLOWED_RECEIVE_CHANNELS = [
   'trigger-global-mute-all',
   'trigger-global-deafen-all',
   'boss-key-mute-all',
-  'boss-key-unmute-all'
+  'boss-key-unmute-all',
+  'open-screen-picker',
+  'cancel-screen-picker'
 ];
 
 contextBridge.exposeInMainWorld('electronAPI', {

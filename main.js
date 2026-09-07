@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell, session, Tray, Menu, nativeImage, ipcMain, globalShortcut } = require('electron');
+const { app, BrowserWindow, shell, session, Tray, Menu, nativeImage, ipcMain, globalShortcut, desktopCapturer } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -9,6 +9,85 @@ let appState = {
   activeAccountName: 'Account 1',
   unreadCount: 0
 };
+
+// Map to track active screen share requests: requestId -> { callback, sources, request }
+const pendingDisplayMediaRequests = new Map();
+
+async function handleDisplayMediaRequest(request, callback) {
+  try {
+    const requestId = 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    log(`Handling display media request [${requestId}] from origin: ${request.securityOrigin || 'unknown'}`);
+
+    // Fetch available screens and windows with preview thumbnails
+    const sources = await desktopCapturer.getSources({
+      types: ['screen', 'window'],
+      fetchWindowIcons: true,
+      thumbnailSize: { width: 360, height: 202 }
+    });
+
+    if (!sources || sources.length === 0) {
+      log(`No display sources found for request [${requestId}]`);
+      callback({ video: null });
+      return;
+    }
+
+    // Cancel any previous pending requests cleanly
+    for (const [oldId, oldReq] of pendingDisplayMediaRequests.entries()) {
+      try {
+        oldReq.callback({ video: null });
+      } catch {}
+      pendingDisplayMediaRequests.delete(oldId);
+    }
+
+    // Save pending request
+    pendingDisplayMediaRequests.set(requestId, { callback, sources, request });
+
+    // Filter out blank-titled windows and format sources for renderer
+    const serializedSources = sources
+      .filter((s) => {
+        if (s.id.startsWith('screen:')) return true;
+        if (!s.name || s.name.trim() === '') return false;
+        return true;
+      })
+      .map((s) => {
+        let thumb = '';
+        let icon = '';
+        try {
+          if (s.thumbnail && !s.thumbnail.isEmpty()) {
+            thumb = s.thumbnail.toDataURL();
+          }
+        } catch {}
+        try {
+          if (s.appIcon && !s.appIcon.isEmpty()) {
+            icon = s.appIcon.toDataURL();
+          }
+        } catch {}
+        return {
+          id: s.id,
+          name: s.name,
+          thumbnail: thumb,
+          appIcon: icon,
+          display_id: s.display_id
+        };
+      });
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (!mainWindow.isVisible()) {
+        mainWindow.show();
+      }
+      mainWindow.focus();
+      mainWindow.webContents.send('open-screen-picker', { requestId, sources: serializedSources });
+    } else {
+      callback({ video: null });
+      pendingDisplayMediaRequests.delete(requestId);
+    }
+  } catch (err) {
+    log(`Display media request handler error: ${err.stack || err}`);
+    try {
+      callback({ video: null });
+    } catch {}
+  }
+}
 
 // Log file is written to userData dir so it works in ASAR-packed production builds
 let logFile;
@@ -93,14 +172,10 @@ function setupSession(targetSession) {
     }
   }
 
-  // WebRTC Screen & Game Sharing Engine — uses native system picker (no deprecated desktopCapturer)
+  // WebRTC Screen & Game Sharing Engine — captures screens/windows with system audio loopback
   if (typeof targetSession.setDisplayMediaRequestHandler === 'function') {
     targetSession.setDisplayMediaRequestHandler((request, callback) => {
-      try {
-        callback({ useSystemPicker: true });
-      } catch (err) {
-        log(`System picker error: ${err}`);
-      }
+      handleDisplayMediaRequest(request, callback);
     });
   }
 
@@ -551,6 +626,51 @@ ipcMain.on('clear-account-cache', async (event, { partition, accountName }) => {
 ipcMain.on('open-external-url', (event, url) => {
   if (typeof url === 'string' && (url.startsWith('https://') || url.startsWith('http://'))) {
     shell.openExternal(url);
+  }
+});
+
+// IPC listener for screen picker source selection
+ipcMain.on('screen-picker-select', (event, { requestId, sourceId, withAudio }) => {
+  const pending = pendingDisplayMediaRequests.get(requestId);
+  if (!pending) {
+    log(`screen-picker-select: no pending request found for [${requestId}]`);
+    return;
+  }
+  pendingDisplayMediaRequests.delete(requestId);
+
+  const selectedSource = pending.sources.find((s) => s.id === sourceId);
+  if (selectedSource) {
+    log(`Screen share confirmed: source [${selectedSource.id}] "${selectedSource.name}", withAudio: ${Boolean(withAudio)}`);
+    try {
+      pending.callback({
+        video: selectedSource,
+        audio: withAudio ? 'loopback' : undefined
+      });
+    } catch (err) {
+      log(`Error calling display media callback: ${err.stack || err}`);
+      try {
+        pending.callback({ video: null });
+      } catch {}
+    }
+  } else {
+    log(`Selected source [${sourceId}] not found in available sources`);
+    try {
+      pending.callback({ video: null });
+    } catch {}
+  }
+});
+
+// IPC listener for screen picker cancellation
+ipcMain.on('screen-picker-cancel', (event, { requestId }) => {
+  const pending = pendingDisplayMediaRequests.get(requestId);
+  if (pending) {
+    pendingDisplayMediaRequests.delete(requestId);
+    log(`Screen share cancelled by user for request [${requestId}]`);
+    try {
+      pending.callback({ video: null });
+    } catch (err) {
+      log(`Error cancelling display media callback: ${err}`);
+    }
   }
 });
 

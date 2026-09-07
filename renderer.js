@@ -1522,11 +1522,16 @@ window.addEventListener('keydown', (e) => {
     closeReloadContextMenu();
     closeModal();
     if (settingsModalOverlay) settingsModalOverlay.classList.remove('active');
+    if (typeof closeScreenPicker === 'function') closeScreenPicker(true);
   }
 
   // Enter to submit modal if open
-  if (e.key === 'Enter' && modalOverlay.classList.contains('active')) {
-    handleModalSubmit();
+  if (e.key === 'Enter') {
+    if (modalOverlay.classList.contains('active')) {
+      handleModalSubmit();
+    } else if (typeof screenPickerModal !== 'undefined' && screenPickerModal && screenPickerModal.classList.contains('active')) {
+      if (typeof submitScreenPicker === 'function') submitScreenPicker();
+    }
   }
 
   // Ctrl+Shift+R or Shift+F5 to reload entire app UI
@@ -2253,6 +2258,249 @@ if (btnClearTheme) {
     applyTheme('default', '');
   });
 }
+
+// ==========================================================================
+// Native WebRTC Screen & Application Share Picker Engine
+// ==========================================================================
+const screenPickerModal = document.getElementById('screen-picker-modal-overlay');
+const screenPickerGrid = document.getElementById('screen-picker-grid');
+const tabPickerScreens = document.getElementById('tab-picker-screens');
+const tabPickerWindows = document.getElementById('tab-picker-windows');
+const badgeScreensCount = document.getElementById('badge-screens-count');
+const badgeWindowsCount = document.getElementById('badge-windows-count');
+const btnScreenPickerCancel = document.getElementById('btn-screen-picker-cancel');
+const btnScreenPickerCloseX = document.getElementById('btn-screen-picker-close-x');
+const btnScreenPickerSubmit = document.getElementById('btn-screen-picker-submit');
+const screenPickerAudioToggle = document.getElementById('screen-picker-audio-toggle');
+
+let currentScreenPickerRequestId = null;
+let currentScreenPickerSources = [];
+let selectedScreenPickerSourceId = null;
+let currentScreenPickerTab = 'screens'; // 'screens' | 'windows'
+
+function openScreenPicker({ requestId, sources }) {
+  currentScreenPickerRequestId = requestId;
+  currentScreenPickerSources = Array.isArray(sources) ? sources : [];
+  selectedScreenPickerSourceId = null;
+
+  const screens = currentScreenPickerSources.filter((s) => s.id.startsWith('screen:'));
+  const windows = currentScreenPickerSources.filter((s) => s.id.startsWith('window:'));
+
+  if (badgeScreensCount) badgeScreensCount.textContent = String(screens.length);
+  if (badgeWindowsCount) badgeWindowsCount.textContent = String(windows.length);
+
+  // Default to screens if available, otherwise windows
+  currentScreenPickerTab = screens.length > 0 ? 'screens' : 'windows';
+  updateScreenPickerTabs();
+  renderScreenPickerSources();
+
+  if (btnScreenPickerSubmit) {
+    btnScreenPickerSubmit.disabled = true;
+  }
+
+  if (screenPickerModal) {
+    screenPickerModal.classList.add('active');
+  }
+}
+
+function closeScreenPicker(wasCancelled = true) {
+  if (!screenPickerModal || !screenPickerModal.classList.contains('active')) return;
+
+  screenPickerModal.classList.remove('active');
+
+  if (wasCancelled && currentScreenPickerRequestId) {
+    eAPI.send('screen-picker-cancel', { requestId: currentScreenPickerRequestId });
+  }
+
+  currentScreenPickerRequestId = null;
+  currentScreenPickerSources = [];
+  selectedScreenPickerSourceId = null;
+}
+
+function updateScreenPickerTabs() {
+  if (tabPickerScreens) {
+    tabPickerScreens.classList.toggle('active', currentScreenPickerTab === 'screens');
+  }
+  if (tabPickerWindows) {
+    tabPickerWindows.classList.toggle('active', currentScreenPickerTab === 'windows');
+  }
+}
+
+function renderScreenPickerSources() {
+  if (!screenPickerGrid) return;
+  screenPickerGrid.innerHTML = '';
+
+  const isScreensTab = currentScreenPickerTab === 'screens';
+  const filtered = currentScreenPickerSources.filter((s) =>
+    isScreensTab ? s.id.startsWith('screen:') : s.id.startsWith('window:')
+  );
+
+  if (filtered.length === 0) {
+    const emptyDiv = document.createElement('div');
+    emptyDiv.className = 'screen-picker-empty';
+    emptyDiv.textContent = isScreensTab ? 'No displays detected.' : 'No open applications found.';
+    screenPickerGrid.appendChild(emptyDiv);
+    return;
+  }
+
+  filtered.forEach((source) => {
+    const card = document.createElement('div');
+    card.className = `screen-source-card ${selectedScreenPickerSourceId === source.id ? 'selected' : ''}`;
+    card.dataset.sourceId = source.id;
+
+    // Preview wrap
+    const previewWrap = document.createElement('div');
+    previewWrap.className = 'screen-source-preview-wrap';
+
+    if (source.thumbnail) {
+      const img = document.createElement('img');
+      img.className = 'screen-source-thumb';
+      img.src = source.thumbnail;
+      img.alt = source.name || 'Preview';
+      previewWrap.appendChild(img);
+    } else {
+      const fallback = document.createElement('div');
+      fallback.className = 'screen-source-thumb-fallback';
+      fallback.innerHTML = isScreensTab
+        ? '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>'
+        : '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>';
+      previewWrap.appendChild(fallback);
+    }
+
+    // Selected checkmark badge
+    const checkBadge = document.createElement('div');
+    checkBadge.className = 'screen-source-selected-badge';
+    checkBadge.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+    previewWrap.appendChild(checkBadge);
+
+    // Footer with icon + name
+    const footer = document.createElement('div');
+    footer.className = 'screen-source-footer';
+
+    if (source.appIcon) {
+      const iconImg = document.createElement('img');
+      iconImg.className = 'screen-source-icon';
+      iconImg.src = source.appIcon;
+      iconImg.alt = '';
+      footer.appendChild(iconImg);
+    } else {
+      const defaultIcon = document.createElement('div');
+      defaultIcon.style.cssText = 'width: 18px; height: 18px; display: flex; align-items: center; justify-content: center; color: var(--text-muted);';
+      defaultIcon.innerHTML = isScreensTab
+        ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line></svg>'
+        : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line></svg>';
+      footer.appendChild(defaultIcon);
+    }
+
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'screen-source-name';
+    nameSpan.textContent = source.name || 'Screen Source';
+    nameSpan.title = source.name || 'Screen Source';
+    footer.appendChild(nameSpan);
+
+    card.appendChild(previewWrap);
+    card.appendChild(footer);
+
+    // Click to select
+    card.addEventListener('click', () => {
+      selectScreenPickerSource(source.id);
+    });
+
+    // Double-click to share immediately
+    card.addEventListener('dblclick', () => {
+      selectScreenPickerSource(source.id);
+      submitScreenPicker();
+    });
+
+    screenPickerGrid.appendChild(card);
+  });
+}
+
+function selectScreenPickerSource(sourceId) {
+  selectedScreenPickerSourceId = sourceId;
+  const cards = screenPickerGrid ? screenPickerGrid.querySelectorAll('.screen-source-card') : [];
+  cards.forEach((c) => {
+    c.classList.toggle('selected', c.dataset.sourceId === sourceId);
+  });
+  if (btnScreenPickerSubmit) {
+    btnScreenPickerSubmit.disabled = !selectedScreenPickerSourceId;
+  }
+}
+
+function submitScreenPicker() {
+  if (!currentScreenPickerRequestId || !selectedScreenPickerSourceId) return;
+
+  const withAudio = screenPickerAudioToggle ? screenPickerAudioToggle.checked : true;
+  eAPI.send('screen-picker-select', {
+    requestId: currentScreenPickerRequestId,
+    sourceId: selectedScreenPickerSourceId,
+    withAudio
+  });
+
+  const selectedSource = currentScreenPickerSources.find((s) => s.id === selectedScreenPickerSourceId);
+  showToast(`Streaming ${selectedSource ? selectedSource.name : 'Screen'}`);
+
+  closeScreenPicker(false);
+}
+
+// Tab click listeners
+if (tabPickerScreens) {
+  tabPickerScreens.addEventListener('click', () => {
+    if (currentScreenPickerTab !== 'screens') {
+      currentScreenPickerTab = 'screens';
+      updateScreenPickerTabs();
+      renderScreenPickerSources();
+    }
+  });
+}
+
+if (tabPickerWindows) {
+  tabPickerWindows.addEventListener('click', () => {
+    if (currentScreenPickerTab !== 'windows') {
+      currentScreenPickerTab = 'windows';
+      updateScreenPickerTabs();
+      renderScreenPickerSources();
+    }
+  });
+}
+
+// Action button listeners
+if (btnScreenPickerCancel) {
+  btnScreenPickerCancel.addEventListener('click', () => {
+    closeScreenPicker(true);
+  });
+}
+
+if (btnScreenPickerCloseX) {
+  btnScreenPickerCloseX.addEventListener('click', () => {
+    closeScreenPicker(true);
+  });
+}
+
+if (btnScreenPickerSubmit) {
+  btnScreenPickerSubmit.addEventListener('click', () => {
+    submitScreenPicker();
+  });
+}
+
+// Click outside modal container to cancel
+if (screenPickerModal) {
+  screenPickerModal.addEventListener('click', (e) => {
+    if (e.target === screenPickerModal) {
+      closeScreenPicker(true);
+    }
+  });
+}
+
+// IPC listener to open screen picker from main process
+eAPI.on('open-screen-picker', (data) => {
+  openScreenPicker(data);
+});
+
+// IPC listener to cancel screen picker from main process if session ends
+eAPI.on('cancel-screen-picker', () => {
+  closeScreenPicker(false);
+});
 
 // Initial boot
 initAccounts();
