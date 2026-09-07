@@ -1,6 +1,49 @@
 # Discord MultiSpace 🚀
 
+[![Release](https://img.shields.io/github/v/release/NextGenInfluencer/discord-multispace?color=5865F2&label=Latest%20Release)](https://github.com/NextGenInfluencer/discord-multispace/releases/latest)
+[![Platform](https://img.shields.io/badge/Platform-Windows-blue.svg)](https://github.com/NextGenInfluencer/discord-multispace)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 A production-grade, ultra-lightweight, multi-account desktop client for Discord built with Electron. Run unlimited Discord accounts side-by-side with complete session isolation, zero account conflicts, community themes, dual split-view, and power-user utilities.
+
+---
+
+## 📥 Download & Getting Started
+
+### Option 1: 1-Click Windows Installer (Recommended)
+1. Go to the **[Latest Releases](https://github.com/NextGenInfluencer/discord-multispace/releases/latest)** page.
+2. Download **`Discord.MultiSpace.Setup.1.1.0.exe`**.
+3. Double-click the downloaded `.exe` file.
+4. The installer will automatically:
+   - Install Discord MultiSpace to your user apps.
+   - Create a clean **Desktop shortcut** (`Discord MultiSpace.lnk`).
+   - Add Discord MultiSpace to your Windows **Start Menu**.
+   - Launch the application automatically!
+
+---
+
+### Option 2: 1-Click Source Setup (`setup.bat`)
+If you downloaded the repository as a ZIP archive or cloned it via Git:
+1. Double-click **`setup.bat`** in the root folder.
+2. It will automatically check dependencies, generate the Desktop shortcut, and launch the application silently in the background.
+
+---
+
+### Option 3: Manual Developer Setup
+```bash
+# Clone the repository
+git clone https://github.com/NextGenInfluencer/discord-multispace.git
+cd discord-multispace
+
+# Install dependencies
+npm install
+
+# Run the app
+npm start
+
+# Build the 1-click installer .exe
+npm run build
+```
 
 ---
 
@@ -35,34 +78,6 @@ A production-grade, ultra-lightweight, multi-account desktop client for Discord 
 
 ---
 
-## 🛠️ Installation & Getting Started
-
-### Prerequisites
-- [Node.js](https://nodejs.org/) (v18 or higher recommended)
-- [Git](https://git-scm.com/)
-
-### Setup
-```bash
-# Clone the repository
-git clone https://github.com/<your-username>/discord-multispace.git
-cd discord-multispace
-
-# Install dependencies
-npm install
-
-# Run the app
-npm start
-```
-
-### Windows Desktop Shortcut (Silent Launcher)
-To create a clean, terminal-free desktop shortcut on Windows:
-```bash
-npm run make-shortcut
-```
-This creates a `Discord MultiSpace.lnk` shortcut on your Desktop pointing to the silent VBS launcher.
-
----
-
 ## 📂 Project Structure
 
 ```
@@ -72,7 +87,8 @@ discord-multispace/
 ├── renderer.js         # UI engine (state management, webviews, themes, split view, audio)
 ├── index.html          # Application layout, sidebar, modals, and context menus
 ├── style.css           # Modern Discord dark theme styling
-├── package.json        # Dependencies and scripts
+├── setup.bat           # 1-click Windows setup & launcher
+├── package.json        # Dependencies and build configuration
 ├── create-shortcut.js  # Desktop shortcut creator script
 ├── launch-silent.vbs   # Windows silent background launcher
 ├── launch.bat          # Batch launcher
