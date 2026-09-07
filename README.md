@@ -1,31 +1,32 @@
 # Discord MultiSpace 🚀
 
-[![Release](https://img.shields.io/github/v/release/NextGenInfluencer/discord-multispace?color=5865F2&label=Latest%20Release)](https://github.com/NextGenInfluencer/discord-multispace/releases/latest)
-[![Platform](https://img.shields.io/badge/Platform-Windows-blue.svg)](https://github.com/NextGenInfluencer/discord-multispace)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Latest Release](https://img.shields.io/github/v/release/NextGenInfluencer/discord-multispace?color=5865F2&logo=discord&logoColor=white)](https://github.com/NextGenInfluencer/discord-multispace/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/NextGenInfluencer/discord-multispace/total?color=blue&logo=windows)](https://github.com/NextGenInfluencer/discord-multispace/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A production-grade, ultra-lightweight, multi-account desktop client for Discord built with Electron. Run unlimited Discord accounts side-by-side with complete session isolation, zero account conflicts, community themes, dual split-view, and power-user utilities.
 
 ---
 
-## 📥 Download & Getting Started
+## 📥 Installation & Download
 
 ### Option 1: 1-Click Windows Installer (Recommended)
-1. Go to the **[Latest Releases](https://github.com/NextGenInfluencer/discord-multispace/releases/latest)** page.
+1. Head over to the **[Latest Release](https://github.com/NextGenInfluencer/discord-multispace/releases/latest)** page.
 2. Download **`Discord.MultiSpace.Setup.1.1.0.exe`**.
-3. Double-click the downloaded `.exe` file.
-4. The installer will automatically:
-   - Install Discord MultiSpace to your user apps.
+3. Double-click the downloaded `.exe` file. The installer will automatically:
+   - Install Discord MultiSpace to your user applications folder.
    - Create a clean **Desktop shortcut** (`Discord MultiSpace.lnk`).
    - Add Discord MultiSpace to your Windows **Start Menu**.
    - Launch the application automatically!
+
+> **Note on Windows SmartScreen:** As an independent, open-source application without an expensive commercial code-signing certificate, Windows SmartScreen may show an *"Unrecognized app"* warning. Simply click **More info** &rarr; **Run anyway** to proceed with installation.
 
 ---
 
 ### Option 2: 1-Click Source Setup (`setup.bat`)
 If you downloaded the repository as a ZIP archive or cloned it via Git:
 1. Double-click **`setup.bat`** in the root folder.
-2. It will automatically check dependencies, generate the Desktop shortcut, and launch the application silently in the background.
+2. It will automatically verify dependencies, generate your Desktop shortcut, and launch the application silently in the background.
 
 ---
 
@@ -38,10 +39,10 @@ cd discord-multispace
 # Install dependencies
 npm install
 
-# Run the app
+# Run the app in development
 npm start
 
-# Build the 1-click installer .exe
+# Build the 1-click installer (.exe)
 npm run build
 ```
 
@@ -49,32 +50,29 @@ npm run build
 
 ## ✨ Key Features
 
-- **🛡️ 100% Isolated Partitions**: Each account operates in its own persistent sandbox (`persist:discord_account_<id>`). Cookies, tokens, voice sessions, local storage, and cache are completely isolated.
-- **🔒 Hardened Security Architecture**:
-  - Strict `contextIsolation: true` and `nodeIntegration: false`.
-  - Minimalist `preload.js` context bridge exposing only strictly whitelisted IPC channels.
-  - Content Security Policy (CSP) enforcement.
-  - Safe external URL & OAuth handling opening exclusively in the default system browser.
-- **🎨 Themes & Community Skins Manager**:
-  - One-click presets: **Midnight Dark**, **Pitch Black AMOLED**, **Clean Minimalist**, and **Default Discord**.
-  - Custom CSS & `@import url(...)` support with automatic URL normalization.
-  - Built-in directory links to BetterDiscord, Equicord, and VSThemes.
-  - Real-time injection across all active and newly opened accounts.
-- **⚡ Dual Split View**: Work across two accounts side-by-side on a single display with independent pane selection.
-- **🌿 Background Memory Saver**: Automatically mutes and throttles background accounts idle for >15 minutes (unless inside an active voice call). Wakes instantly on click.
-- **🎙️ WebRTC Voice, Video & Screen Sharing**: Native system picker screen sharing support with system audio loopback capture.
-- **📌 Windows System Tray & Taskbar Badges**: Live account status, unread mention counts on the Windows taskbar, tray minimize/restore, and quick session reload.
-- **🚨 Emergency Boss Key (`Ctrl + Shift + H`)**: Instantly mutes all accounts and hides the application to the system tray. Pressing it again restores the window and audio.
-- **🔍 Per-Pane Zoom Scaling**: Zoom in/out per account (`Ctrl + + / - / 0`) with persistent zoom settings stored in `localStorage`.
-- **⌨️ Keyboard Shortcuts**:
-  - `Ctrl + 1` .. `Ctrl + 9`: Switch directly to accounts 1–9.
-  - `Ctrl + Tab` / `Ctrl + Shift + Tab`: Cycle accounts.
-  - `Ctrl + Alt + M`: Global Mute All.
-  - `Ctrl + Alt + D`: Global Deafen All.
-  - `Ctrl + Shift + H`: Emergency Boss Key (Mute & Hide / Restore).
-  - `F5` / `Ctrl + R`: Reload active Discord tab.
-  - `Ctrl + Shift + R`: Force reload the entire MultiSpace application.
-  - `Alt`: Show/hide native menu bar.
+- **🛡️ Session Sandboxing:** Multi-account persistence with hardened `contextIsolation: true` and dedicated persistent partitions (`persist:discord_account_<id>`). Cookies, tokens, voice sessions, local storage, and cache are completely isolated with zero crosstalk.
+- **⚡ Split-View Workspace:** Dual-pane concurrent Discord workspaces. Work across two accounts side-by-side on a single display with independent pane selection.
+- **🎨 Theme Engine:** Real-time CSS injection supporting built-in presets (**Midnight Dark**, **Pitch Black AMOLED**, **Clean Minimalist**, and **Default Discord**) as well as custom `@import url(...)` stylesheets from BetterDiscord, Equicord, and VSThemes.
+- **🌿 Background Memory Saver:** Automatically mutes and throttles background accounts idle for >15 minutes (unless inside an active voice call). Wakes instantly on click.
+- **🎙️ WebRTC Voice, Video & Screen Sharing:** Native system picker screen sharing support with system audio loopback capture.
+- **📌 Windows System Tray & Taskbar Badges:** Live account status, unread mention counts on the Windows taskbar, tray minimize/restore, and quick session reload.
+- **🚨 Emergency Boss Key (`Ctrl + Shift + H`):** Instantly mutes all accounts and hides the application to the system tray. Pressing it again restores the window and audio.
+- **🔍 Per-Pane Zoom Scaling:** Zoom in/out per account (`Ctrl + + / - / 0`) with persistent zoom settings stored in `localStorage`.
+
+---
+
+## ⌨️ Keyboard Shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl + Alt + M` | Global Mute All accounts |
+| `Ctrl + Alt + D` | Global Deafen All accounts |
+| `Ctrl + Shift + H` | Emergency Boss Key (Instant hide to tray & mute / Restore) |
+| `Ctrl + 1` .. `Ctrl + 9` | Switch directly to accounts 1–9 |
+| `Ctrl + Tab` / `Ctrl + Shift + Tab` | Cycle between open accounts |
+| `F5` / `Ctrl + R` | Reload active Discord tab |
+| `Ctrl + Shift + R` | Force reload the entire MultiSpace application |
+| `Alt` | Toggle native top menu bar |
 
 ---
 
