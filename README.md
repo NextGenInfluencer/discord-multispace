@@ -12,7 +12,7 @@ A production-grade, ultra-lightweight, multi-account desktop client for Discord 
 
 ### Option 1: 1-Click Windows Installer (Recommended)
 1. Head over to the **[Latest Release](https://github.com/NextGenInfluencer/discord-multispace/releases/latest)** page.
-2. Download **`Discord.MultiSpace.Setup.1.1.0.exe`**.
+2. Download **`Discord.MultiSpace.Setup.1.1.1.exe`**.
 3. Double-click the downloaded `.exe` file. The installer will automatically:
    - Install Discord MultiSpace to your user applications folder.
    - Create a clean **Desktop shortcut** (`Discord MultiSpace.lnk`).
