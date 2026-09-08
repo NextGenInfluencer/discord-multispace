@@ -1,6 +1,9 @@
 const { app, BrowserWindow, shell, session, Tray, Menu, nativeImage, ipcMain, globalShortcut, desktopCapturer } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { exec } = require('child_process');
+
+app.setName('Discord MultiSpace');
 
 let tray = null;
 let mainWindow = null;
@@ -568,10 +571,41 @@ ipcMain.on('update-taskbar-overlay', (event, { count, dataUrl }) => {
   }
 });
 
+/**
+ * Resolves the appropriate executable path and arguments for Windows login auto-start.
+ * Prioritizes the installed production executable if available, or packages paths safely.
+ */
+function getStartupTarget() {
+  const installedExe = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'discord-multispace', 'Discord MultiSpace.exe');
+  if (app.isPackaged) {
+    return { path: process.execPath, args: [] };
+  }
+  if (fs.existsSync(installedExe)) {
+    return { path: installedExe, args: [] };
+  }
+  return { path: process.execPath, args: [`"${path.resolve(app.getAppPath())}"`] };
+}
+
+/**
+ * Clean up legacy or unpackaged Electron Run registry entries if they exist
+ */
+function cleanLegacyStartupRegistry() {
+  if (process.platform === 'win32') {
+    try {
+      exec('reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "electron.app.Electron" /f', () => {});
+    } catch {}
+  }
+}
+
 // IPC handlers for Windows Startup item
 ipcMain.handle('get-startup-setting', () => {
   try {
-    return app.getLoginItemSettings().openAtLogin;
+    const target = getStartupTarget();
+    return app.getLoginItemSettings({
+      path: target.path,
+      args: target.args,
+      name: 'Discord MultiSpace'
+    }).openAtLogin;
   } catch {
     return false;
   }
@@ -600,11 +634,15 @@ ipcMain.handle('fetch-theme-css', async (event, url) => {
 
 ipcMain.on('set-startup-setting', (event, openAtLogin) => {
   try {
+    cleanLegacyStartupRegistry();
+    const target = getStartupTarget();
     app.setLoginItemSettings({
       openAtLogin: Boolean(openAtLogin),
-      openAsHidden: true
+      path: target.path,
+      args: target.args,
+      name: 'Discord MultiSpace'
     });
-    log(`Launch on startup updated: ${openAtLogin}`);
+    log(`Launch on startup updated: ${openAtLogin} (target: ${target.path})`);
   } catch (err) {
     log(`Failed to set startup setting: ${err}`);
   }
@@ -722,6 +760,7 @@ if (!gotTheLock) {
 
   app.whenReady().then(() => {
     log('app.whenReady fired');
+    cleanLegacyStartupRegistry();
     createWindow();
     createTray();
 
