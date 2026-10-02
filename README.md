@@ -12,12 +12,13 @@ A production-grade, ultra-lightweight, multi-account desktop client for Discord 
 
 ### Option 1: 1-Click Windows Installer (Recommended)
 1. Head over to the **[Latest Release](https://github.com/NextGenInfluencer/discord-multispace/releases/latest)** page.
-2. Download **`Discord.MultiSpace.Setup.1.1.1.exe`**.
+2. Download **`Discord.MultiSpace.Setup.1.1.4.exe`** (or the latest release).
 3. Double-click the downloaded `.exe` file. The installer will automatically:
    - Install Discord MultiSpace to your user applications folder.
    - Create a clean **Desktop shortcut** (`Discord MultiSpace.lnk`).
    - Add Discord MultiSpace to your Windows **Start Menu**.
    - Launch the application automatically!
+   - **Automatic Future Updates:** Once installed, Discord MultiSpace will automatically detect, download, and install future GitHub releases in the background!
 
 > **Note on Windows SmartScreen:** As an independent, open-source application without an expensive commercial code-signing certificate, Windows SmartScreen may show an *"Unrecognized app"* warning. Simply click **More info** &rarr; **Run anyway** to proceed with installation.
 
@@ -54,6 +55,7 @@ npm run build
 - **⚡ Split-View Workspace:** Dual-pane concurrent Discord workspaces. Work across two accounts side-by-side on a single display with independent pane selection.
 - **🎨 Theme Engine:** Real-time CSS injection supporting built-in presets (**Midnight Dark**, **Pitch Black AMOLED**, **Clean Minimalist**, and **Default Discord**) as well as custom `@import url(...)` stylesheets from BetterDiscord, Equicord, and VSThemes.
 - **🌿 Background Memory Saver:** Automatically mutes and throttles background accounts idle for >15 minutes (unless inside an active voice call). Wakes instantly on click.
+- **🔄 Seamless In-App Auto-Updates:** Integrated background updater pulls releases directly from GitHub (`NextGenInfluencer/discord-multispace`). Includes 1-click update checks in Settings and the System Tray, live download progress, and seamless restart-and-install.
 - **🎙️ WebRTC Voice, Video & Screen Sharing:** Built-in screen and application window picker with live preview thumbnails, single/double-click selection, and WASAPI Windows system audio loopback capture.
 - **📌 Windows System Tray & Taskbar Badges:** Live account status, unread mention counts on the Windows taskbar, tray minimize/restore, and quick session reload.
 - **🚨 Emergency Boss Key (`Ctrl + Shift + H`):** Instantly mutes all accounts and hides the application to the system tray. Pressing it again restores the window and audio.

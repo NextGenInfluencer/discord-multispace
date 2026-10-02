@@ -1,7 +1,9 @@
 const { app, BrowserWindow, shell, session, Tray, Menu, nativeImage, ipcMain, globalShortcut, desktopCapturer } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
 const { exec } = require('child_process');
+const { autoUpdater } = require('electron-updater');
 
 app.setName('Discord MultiSpace');
 
@@ -545,6 +547,17 @@ function updateTrayMenu() {
       }
     },
     {
+      label: '🔄 Check for Updates...',
+      click: () => {
+        if (mainWindow) {
+          if (!mainWindow.isVisible()) mainWindow.show();
+          if (mainWindow.isMinimized()) mainWindow.restore();
+          mainWindow.focus();
+        }
+        triggerUpdateCheck(true);
+      }
+    },
+    {
       type: 'separator'
     },
     {
@@ -793,6 +806,132 @@ function handleBossKey() {
   }
 }
 
+/**
+ * Auto-Updater Setup & Life Cycle Management
+ */
+function setupAutoUpdater() {
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('checking-for-update', () => {
+    log('AutoUpdater: Checking for updates...');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-checking');
+    }
+  });
+
+  autoUpdater.on('update-available', (info) => {
+    log(`AutoUpdater: Update available [v${info.version}]`);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-available', info);
+    }
+  });
+
+  autoUpdater.on('update-not-available', (info) => {
+    log('AutoUpdater: Update not available. Current version is up-to-date.');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-not-available', info);
+    }
+  });
+
+  autoUpdater.on('download-progress', (progressObj) => {
+    log(`AutoUpdater: Download progress ${Math.round(progressObj.percent)}%`);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-download-progress', {
+        percent: progressObj.percent,
+        bytesPerSecond: progressObj.bytesPerSecond,
+        transferred: progressObj.transferred,
+        total: progressObj.total
+      });
+    }
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    log(`AutoUpdater: Update downloaded successfully [v${info.version}]`);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-downloaded', info);
+    }
+  });
+
+  autoUpdater.on('error', (err) => {
+    log(`AutoUpdater error: ${err.message || err}`);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-error', { message: err.message || String(err) });
+    }
+  });
+}
+
+function triggerUpdateCheck(manual = false) {
+  log(`triggerUpdateCheck called (manual: ${manual}, isPackaged: ${app.isPackaged})`);
+  if (!app.isPackaged) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-checking');
+    }
+    const options = {
+      hostname: 'api.github.com',
+      path: '/repos/NextGenInfluencer/discord-multispace/releases/latest',
+      headers: { 'User-Agent': 'Discord-MultiSpace-Updater' }
+    };
+    https.get(options, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const release = JSON.parse(data);
+          const latestTag = (release.tag_name || '').replace(/^v/, '');
+          const currentVersion = app.getVersion();
+          if (latestTag && latestTag !== currentVersion) {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('update-available', {
+                version: latestTag,
+                releaseNotes: release.body,
+                isDev: true
+              });
+            }
+          } else {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('update-not-available', {
+                version: currentVersion,
+                isDev: true
+              });
+            }
+          }
+        } catch {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('update-not-available', { isDev: true });
+          }
+        }
+      });
+    }).on('error', (err) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('update-error', { message: err.message });
+      }
+    });
+    return;
+  }
+
+  autoUpdater.checkForUpdates().catch((err) => {
+    log(`checkForUpdates failed: ${err.message}`);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-error', { message: err.message });
+    }
+  });
+}
+
+// IPC Handlers for Updater
+ipcMain.on('check-for-updates', () => {
+  triggerUpdateCheck(true);
+});
+
+ipcMain.on('install-update-now', () => {
+  log('install-update-now received: restarting and installing update');
+  autoUpdater.quitAndInstall(false, true);
+});
+
+ipcMain.handle('get-app-version', () => {
+  return app.getVersion();
+});
+
 // Single application instance lock
 const gotTheLock = app.requestSingleInstanceLock();
 log(`gotTheLock: ${gotTheLock}`);
@@ -822,6 +961,15 @@ if (!gotTheLock) {
     cleanLegacyStartupRegistry();
     createWindow();
     createTray();
+    setupAutoUpdater();
+
+    // Check for updates 6s after app launch, then every 4 hours
+    setTimeout(() => {
+      triggerUpdateCheck(false);
+    }, 6000);
+    setInterval(() => {
+      triggerUpdateCheck(false);
+    }, 4 * 60 * 60 * 1000);
 
     // Register Global Shortcuts:
     // Ctrl+Alt+M (Mute), Ctrl+Alt+D (Deafen), Ctrl+Shift+H (Emergency Boss Key)

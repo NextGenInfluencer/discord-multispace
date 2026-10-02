@@ -19,13 +19,16 @@ const ALLOWED_SEND_CHANNELS = [
   'clear-account-cache',
   'set-startup-setting',
   'screen-picker-select',
-  'screen-picker-cancel'
+  'screen-picker-cancel',
+  'check-for-updates',
+  'install-update-now'
 ];
 
 // Whitelist of IPC channels the renderer is allowed to invoke (request/response)
 const ALLOWED_INVOKE_CHANNELS = [
   'get-startup-setting',
-  'fetch-theme-css'
+  'fetch-theme-css',
+  'get-app-version'
 ];
 
 // Whitelist of IPC channels the renderer is allowed to listen on
@@ -37,7 +40,13 @@ const ALLOWED_RECEIVE_CHANNELS = [
   'boss-key-mute-all',
   'boss-key-unmute-all',
   'open-screen-picker',
-  'cancel-screen-picker'
+  'cancel-screen-picker',
+  'update-checking',
+  'update-available',
+  'update-not-available',
+  'update-download-progress',
+  'update-downloaded',
+  'update-error'
 ];
 
 contextBridge.exposeInMainWorld('electronAPI', {

@@ -2558,3 +2558,178 @@ eAPI.on('cancel-screen-picker', () => {
 // Initial boot
 initAccounts();
 updateReloadButtonVisibility();
+
+// ==========================================================================
+// Software Auto-Updater UI & IPC Event Wiring
+// ==========================================================================
+const updaterVersionTag = document.getElementById('updater-version-tag');
+const updaterStatusDot = document.getElementById('updater-status-dot');
+const updaterStatusText = document.getElementById('updater-status-text');
+const updaterSubtext = document.getElementById('updater-subtext');
+const updaterProgressContainer = document.getElementById('updater-progress-container');
+const updaterProgressBar = document.getElementById('updater-progress-bar');
+const btnCheckUpdates = document.getElementById('btn-check-updates');
+const btnCheckUpdatesText = document.getElementById('btn-check-updates-text');
+const btnInstallUpdate = document.getElementById('btn-install-update');
+const updateBanner = document.getElementById('update-notification-banner');
+const updateBannerTitle = document.getElementById('update-banner-title');
+const updateBannerDesc = document.getElementById('update-banner-desc');
+const btnBannerAction = document.getElementById('btn-banner-action');
+const btnBannerDismiss = document.getElementById('btn-banner-dismiss');
+
+let isManualUpdateCheck = false;
+
+// Query current version from main process
+if (eAPI && typeof eAPI.invoke === 'function') {
+  eAPI.invoke('get-app-version').then((version) => {
+    if (version && updaterVersionTag) {
+      updaterVersionTag.textContent = `v${version}`;
+    }
+  }).catch(() => {});
+}
+
+if (btnCheckUpdates) {
+  btnCheckUpdates.addEventListener('click', () => {
+    isManualUpdateCheck = true;
+    btnCheckUpdates.disabled = true;
+    if (btnCheckUpdatesText) btnCheckUpdatesText.textContent = 'Checking...';
+    if (updaterStatusDot) updaterStatusDot.className = 'updater-dot checking';
+    if (updaterStatusText) updaterStatusText.textContent = 'Checking for updates...';
+    if (updaterSubtext) updaterSubtext.textContent = 'Querying GitHub releases repository...';
+    eAPI.send('check-for-updates');
+  });
+}
+
+if (btnInstallUpdate) {
+  btnInstallUpdate.addEventListener('click', () => {
+    btnInstallUpdate.disabled = true;
+    btnInstallUpdate.textContent = 'Restarting...';
+    eAPI.send('install-update-now');
+  });
+}
+
+if (btnBannerDismiss && updateBanner) {
+  btnBannerDismiss.addEventListener('click', () => {
+    updateBanner.style.display = 'none';
+  });
+}
+
+if (eAPI && typeof eAPI.on === 'function') {
+  eAPI.on('update-checking', () => {
+    if (updaterStatusDot) updaterStatusDot.className = 'updater-dot checking';
+    if (updaterStatusText) updaterStatusText.textContent = 'Checking for updates...';
+    if (updaterSubtext) updaterSubtext.textContent = 'Querying GitHub releases repository...';
+  });
+
+  eAPI.on('update-available', (info) => {
+    const versionStr = info && info.version ? `v${info.version}` : 'New Release';
+    if (updaterStatusDot) updaterStatusDot.className = 'updater-dot available';
+    if (updaterStatusText) updaterStatusText.textContent = `Update available (${versionStr})`;
+    if (updaterSubtext) {
+      updaterSubtext.textContent = info && info.isDev
+        ? 'A newer version is published on GitHub.'
+        : 'Downloading update in the background...';
+    }
+    if (updaterProgressContainer) updaterProgressContainer.style.display = 'block';
+    if (updaterProgressBar) updaterProgressBar.style.width = '0%';
+    if (btnCheckUpdates) {
+      btnCheckUpdates.disabled = false;
+      if (btnCheckUpdatesText) btnCheckUpdatesText.textContent = 'Check for Updates';
+    }
+
+    // Show floating top banner
+    if (updateBanner && updateBannerTitle && updateBannerDesc && btnBannerAction) {
+      updateBannerTitle.textContent = `Update Available: ${versionStr}`;
+      if (info && info.isDev) {
+        updateBannerDesc.textContent = 'A new release is available on GitHub.';
+        btnBannerAction.textContent = 'View Release';
+        btnBannerAction.onclick = () => {
+          eAPI.openExternal('https://github.com/NextGenInfluencer/discord-multispace/releases');
+        };
+      } else {
+        updateBannerDesc.textContent = 'Downloading update package in the background...';
+        btnBannerAction.textContent = 'Downloading...';
+        btnBannerAction.disabled = true;
+      }
+      updateBanner.style.display = 'block';
+    }
+  });
+
+  eAPI.on('update-not-available', () => {
+    if (updaterStatusDot) updaterStatusDot.className = 'updater-dot';
+    if (updaterStatusText) updaterStatusText.textContent = 'Up to date';
+    if (updaterSubtext) updaterSubtext.textContent = 'You are running the latest version of Discord MultiSpace.';
+    if (updaterProgressContainer) updaterProgressContainer.style.display = 'none';
+    if (btnCheckUpdates) {
+      btnCheckUpdates.disabled = false;
+      if (btnCheckUpdatesText) btnCheckUpdatesText.textContent = 'Check for Updates';
+    }
+    if (isManualUpdateCheck) {
+      showToast('Discord MultiSpace is up to date!');
+      isManualUpdateCheck = false;
+    }
+  });
+
+  eAPI.on('update-download-progress', (progress) => {
+    const pct = progress && progress.percent !== undefined ? Math.round(progress.percent) : 0;
+    if (updaterStatusDot) updaterStatusDot.className = 'updater-dot downloading';
+    if (updaterStatusText) updaterStatusText.textContent = `Downloading update (${pct}%)`;
+    if (updaterProgressContainer) updaterProgressContainer.style.display = 'block';
+    if (updaterProgressBar) updaterProgressBar.style.width = `${pct}%`;
+    if (updaterSubtext && progress) {
+      const speedMb = progress.bytesPerSecond ? (progress.bytesPerSecond / 1024 / 1024).toFixed(1) : '0.0';
+      const transferredMb = progress.transferred ? (progress.transferred / 1024 / 1024).toFixed(1) : '0';
+      const totalMb = progress.total ? (progress.total / 1024 / 1024).toFixed(1) : '0';
+      updaterSubtext.textContent = `${speedMb} MB/s • ${transferredMb}MB / ${totalMb}MB`;
+    }
+    if (updateBanner && updateBannerDesc) {
+      updateBannerDesc.textContent = `Downloading update (${pct}%)...`;
+    }
+  });
+
+  eAPI.on('update-downloaded', (info) => {
+    const versionStr = info && info.version ? `v${info.version}` : '';
+    if (updaterStatusDot) updaterStatusDot.className = 'updater-dot ready';
+    if (updaterStatusText) updaterStatusText.textContent = `Update ready to install! ${versionStr}`;
+    if (updaterSubtext) updaterSubtext.textContent = 'Restart the app now to finish updating.';
+    if (updaterProgressContainer) updaterProgressContainer.style.display = 'block';
+    if (updaterProgressBar) updaterProgressBar.style.width = '100%';
+
+    if (btnCheckUpdates) btnCheckUpdates.style.display = 'none';
+    if (btnInstallUpdate) {
+      btnInstallUpdate.style.display = 'inline-block';
+      btnInstallUpdate.disabled = false;
+      btnInstallUpdate.textContent = 'Restart & Install';
+    }
+
+    if (updateBanner && updateBannerTitle && updateBannerDesc && btnBannerAction) {
+      updateBannerTitle.textContent = `Update Ready ${versionStr}`.trim();
+      updateBannerDesc.textContent = 'The latest version is downloaded and ready to apply.';
+      btnBannerAction.textContent = 'Restart & Install';
+      btnBannerAction.disabled = false;
+      btnBannerAction.onclick = () => {
+        btnBannerAction.disabled = true;
+        btnBannerAction.textContent = 'Restarting...';
+        eAPI.send('install-update-now');
+      };
+      updateBanner.style.display = 'block';
+    }
+
+    showToast('A new update is downloaded and ready to install!');
+  });
+
+  eAPI.on('update-error', (err) => {
+    if (updaterStatusDot) updaterStatusDot.className = 'updater-dot error';
+    if (updaterStatusText) updaterStatusText.textContent = 'Update check failed';
+    if (updaterSubtext) updaterSubtext.textContent = (err && err.message) || 'Could not connect to update server.';
+    if (btnCheckUpdates) {
+      btnCheckUpdates.disabled = false;
+      if (btnCheckUpdatesText) btnCheckUpdatesText.textContent = 'Check for Updates';
+    }
+    if (isManualUpdateCheck) {
+      showToast('Could not reach update server.');
+      isManualUpdateCheck = false;
+    }
+  });
+}
+
