@@ -19,7 +19,7 @@ const pendingDisplayMediaRequests = new Map();
 async function handleDisplayMediaRequest(request, callback) {
   try {
     const requestId = 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-    log(`Handling display media request [${requestId}] from origin: ${request.securityOrigin || 'unknown'}`);
+    log(`Handling display media request [${requestId}] from origin: ${request.securityOrigin || 'unknown'} (videoRequested: ${request.videoRequested}, audioRequested: ${request.audioRequested})`);
 
     // Fetch available screens and windows with preview thumbnails
     const sources = await desktopCapturer.getSources({
@@ -249,10 +249,69 @@ function createWindow() {
     setupSession(newSession);
   });
 
+  // Code injected into Discord webviews to guarantee screen sharing includes system audio loopback
+  const DISCORD_MEDIA_AUDIO_PATCH = `
+    (() => {
+      try {
+        if (window.__discordMultiSpaceAudioPatched) return;
+        window.__discordMultiSpaceAudioPatched = true;
+
+        if (navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function') {
+          const originalGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
+          navigator.mediaDevices.getDisplayMedia = async function(constraints) {
+            const safe = (typeof constraints === 'object' && constraints !== null)
+              ? Object.assign({}, constraints)
+              : { video: true };
+
+            // Ensure system audio loopback is always requested in constraints
+            if (!safe.audio || typeof safe.audio !== 'object') {
+              safe.audio = {
+                autoGainControl: false,
+                echoCancellation: false,
+                noiseSuppression: false,
+                systemAudio: 'include'
+              };
+            } else {
+              safe.audio.autoGainControl = false;
+              safe.audio.echoCancellation = false;
+              safe.audio.noiseSuppression = false;
+              safe.audio.systemAudio = 'include';
+            }
+
+            const stream = await originalGetDisplayMedia(safe);
+            const audioTracks = stream.getAudioTracks();
+            if (audioTracks && audioTracks.length > 0) {
+              audioTracks.forEach((track) => {
+                track.enabled = true;
+                if ('contentHint' in track) {
+                  try { track.contentHint = 'music'; } catch (e) {}
+                }
+              });
+            }
+            return stream;
+          };
+        }
+      } catch (e) {}
+    })();
+  `;
+
   // Handle all web-contents (including webviews)
   app.on('web-contents-created', (event, contents) => {
     if (contents.session) {
       setupSession(contents.session);
+    }
+
+    // Inject screen-share loopback audio bridge into Discord web views
+    if (contents.getType() === 'webview') {
+      const injectBridge = () => {
+        if (!contents.isDestroyed()) {
+          contents.executeJavaScript(DISCORD_MEDIA_AUDIO_PATCH).catch(() => {});
+        }
+      };
+      contents.on('dom-ready', injectBridge);
+      contents.on('did-finish-load', injectBridge);
+      contents.on('did-navigate', injectBridge);
+      contents.on('did-navigate-in-page', injectBridge);
     }
 
     // Intercept window.open popups & OAuth flows to open safely in external browser

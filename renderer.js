@@ -978,11 +978,61 @@ function getOrCreateWebview(account) {
       handleTitleNotifications(account.id, event.title);
     });
 
+    const injectWebviewAudioBridge = () => {
+      try {
+        wv.executeJavaScript(`
+          (() => {
+            try {
+              if (window.__discordMultiSpaceAudioPatched) return;
+              window.__discordMultiSpaceAudioPatched = true;
+
+              if (navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function') {
+                const originalGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
+                navigator.mediaDevices.getDisplayMedia = async function(constraints) {
+                  const safe = (typeof constraints === 'object' && constraints !== null)
+                    ? Object.assign({}, constraints)
+                    : { video: true };
+
+                  // Ensure system audio loopback is always requested in constraints
+                  if (!safe.audio || typeof safe.audio !== 'object') {
+                    safe.audio = {
+                      autoGainControl: false,
+                      echoCancellation: false,
+                      noiseSuppression: false,
+                      systemAudio: 'include'
+                    };
+                  } else {
+                    safe.audio.autoGainControl = false;
+                    safe.audio.echoCancellation = false;
+                    safe.audio.noiseSuppression = false;
+                    safe.audio.systemAudio = 'include';
+                  }
+
+                  const stream = await originalGetDisplayMedia(safe);
+                  const audioTracks = stream.getAudioTracks();
+                  if (audioTracks && audioTracks.length > 0) {
+                    audioTracks.forEach((track) => {
+                      track.enabled = true;
+                      if ('contentHint' in track) {
+                        try { track.contentHint = 'music'; } catch (e) {}
+                      }
+                    });
+                  }
+                  return stream;
+                };
+              }
+            } catch (e) {}
+          })();
+        `).catch(() => {});
+      } catch (e) {}
+    };
+
     wv.addEventListener('dom-ready', () => {
       clearWebviewError(account.id);
       pollAccountNotifications(account.id);
       applyAccountZoom(account.id);
       injectThemeIntoWebview(wv);
+      injectWebviewAudioBridge();
 
       // Support seamless file drag-and-drop into Discord chat box
       wv.executeJavaScript(`
@@ -995,6 +1045,9 @@ function getOrCreateWebview(account) {
         })()
       `).catch(() => {});
     });
+
+    wv.addEventListener('did-navigate', injectWebviewAudioBridge);
+    wv.addEventListener('did-navigate-in-page', injectWebviewAudioBridge);
 
     webviewContainer.appendChild(wv);
   }
