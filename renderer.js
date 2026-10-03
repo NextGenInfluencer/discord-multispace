@@ -2212,6 +2212,9 @@ if (btnOpenSettings) {
     }
     updateReloadButtonVisibility();
     updateThemeUI();
+    if (typeof populateStreamAudioDevices === 'function') {
+      populateStreamAudioDevices();
+    }
     if (settingsModalOverlay) {
       settingsModalOverlay.classList.add('active');
     }
@@ -2325,6 +2328,87 @@ const btnScreenPickerCancel = document.getElementById('btn-screen-picker-cancel'
 const btnScreenPickerCloseX = document.getElementById('btn-screen-picker-close-x');
 const btnScreenPickerSubmit = document.getElementById('btn-screen-picker-submit');
 const screenPickerAudioToggle = document.getElementById('screen-picker-audio-toggle');
+const screenPickerAudioDeviceSelect = document.getElementById('screen-picker-audio-device-select');
+const selectStreamAudioSource = document.getElementById('select-stream-audio-source');
+
+const STORAGE_STREAM_AUDIO_DEVICE = 'discord_multispace_stream_audio_device';
+let currentStreamAudioDevice = localStorage.getItem(STORAGE_STREAM_AUDIO_DEVICE) || 'loopback';
+
+async function populateStreamAudioDevices() {
+  try {
+    const allDevices = await navigator.mediaDevices.enumerateDevices();
+    const audioInputs = allDevices.filter((d) => d.kind === 'audioinput');
+
+    const updateSelect = (selectEl) => {
+      if (!selectEl) return;
+      selectEl.innerHTML = '';
+
+      const defOpt = document.createElement('option');
+      defOpt.value = 'loopback';
+      defOpt.textContent = 'Default (Windows System Audio Loopback)';
+      selectEl.appendChild(defOpt);
+
+      audioInputs.forEach((dev) => {
+        const label = dev.label || (dev.deviceId ? `Audio Device (${dev.deviceId.slice(0, 8)}...)` : '');
+        if (!label) return;
+        const opt = document.createElement('option');
+        opt.value = label;
+        opt.textContent = label;
+        selectEl.appendChild(opt);
+      });
+
+      selectEl.value = currentStreamAudioDevice;
+      if (selectEl.value !== currentStreamAudioDevice) {
+        let found = false;
+        for (let i = 0; i < selectEl.options.length; i++) {
+          if (selectEl.options[i].value && currentStreamAudioDevice && 
+             (selectEl.options[i].value.includes(currentStreamAudioDevice) || currentStreamAudioDevice.includes(selectEl.options[i].value))) {
+            selectEl.selectedIndex = i;
+            currentStreamAudioDevice = selectEl.options[i].value;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          selectEl.value = 'loopback';
+          currentStreamAudioDevice = 'loopback';
+        }
+      }
+    };
+
+    updateSelect(selectStreamAudioSource);
+    updateSelect(screenPickerAudioDeviceSelect);
+  } catch (err) {
+    console.warn('Failed to enumerate audio devices for screen share:', err);
+  }
+}
+
+function handleStreamAudioDeviceSelection(newVal) {
+  currentStreamAudioDevice = newVal || 'loopback';
+  localStorage.setItem(STORAGE_STREAM_AUDIO_DEVICE, currentStreamAudioDevice);
+  if (selectStreamAudioSource) selectStreamAudioSource.value = currentStreamAudioDevice;
+  if (screenPickerAudioDeviceSelect) screenPickerAudioDeviceSelect.value = currentStreamAudioDevice;
+  if (eAPI && typeof eAPI.send === 'function') {
+    eAPI.send('set-stream-audio-device', currentStreamAudioDevice);
+  }
+}
+
+if (selectStreamAudioSource) {
+  selectStreamAudioSource.addEventListener('change', () => {
+    handleStreamAudioDeviceSelection(selectStreamAudioSource.value);
+  });
+}
+
+if (screenPickerAudioDeviceSelect) {
+  screenPickerAudioDeviceSelect.addEventListener('change', () => {
+    handleStreamAudioDeviceSelection(screenPickerAudioDeviceSelect.value);
+  });
+}
+
+if (eAPI && typeof eAPI.send === 'function') {
+  eAPI.send('set-stream-audio-device', currentStreamAudioDevice);
+}
+populateStreamAudioDevices();
 
 let currentScreenPickerRequestId = null;
 let currentScreenPickerSources = [];
@@ -2332,6 +2416,7 @@ let selectedScreenPickerSourceId = null;
 let currentScreenPickerTab = 'screens'; // 'screens' | 'windows'
 
 function openScreenPicker({ requestId, sources }) {
+  populateStreamAudioDevices();
   currentScreenPickerRequestId = requestId;
   currentScreenPickerSources = Array.isArray(sources) ? sources : [];
   selectedScreenPickerSourceId = null;
@@ -2484,11 +2569,13 @@ function submitScreenPicker() {
   if (!currentScreenPickerRequestId || !selectedScreenPickerSourceId) return;
 
   const withAudio = screenPickerAudioToggle ? screenPickerAudioToggle.checked : true;
+  const audioSourceDeviceId = screenPickerAudioDeviceSelect ? screenPickerAudioDeviceSelect.value : currentStreamAudioDevice;
 
   eAPI.send('screen-picker-select', {
     requestId: currentScreenPickerRequestId,
     sourceId: selectedScreenPickerSourceId,
-    withAudio
+    withAudio,
+    audioSourceDeviceId
   });
 
   const selectedSource = currentScreenPickerSources.find((s) => s.id === selectedScreenPickerSourceId);

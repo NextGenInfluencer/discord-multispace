@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell, session, Tray, Menu, nativeImage, ipcMain, globalShortcut, desktopCapturer } = require('electron');
+const { app, BrowserWindow, shell, session, Tray, Menu, nativeImage, ipcMain, globalShortcut, desktopCapturer, webContents } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
@@ -15,11 +15,11 @@ let appState = {
   unreadCount: 0
 };
 
-
 // Map to track active screen share requests: requestId -> { callback, sources, request }
 const pendingDisplayMediaRequests = new Map();
 let lastConfirmedDisplayMedia = null;
 let lastConfirmedTimestamp = 0;
+let currentStreamAudioDeviceLabel = 'loopback';
 
 async function handleDisplayMediaRequest(request, callback) {
   try {
@@ -271,7 +271,7 @@ function createWindow() {
     setupSession(newSession);
   });
 
-  // Code injected into Discord webviews to guarantee screen sharing captures crystal-clear system audio
+  // Code injected into Discord webviews to guarantee screen sharing captures crystal-clear system audio or custom hardware input
   const DISCORD_MEDIA_AUDIO_PATCH = `
     (() => {
       try {
@@ -300,15 +300,55 @@ function createWindow() {
             }
 
             const stream = await originalGetDisplayMedia(safe);
-            const audioTracks = stream.getAudioTracks();
-            if (audioTracks && audioTracks.length > 0) {
-              audioTracks.forEach((track) => {
-                track.enabled = true;
-                if ('contentHint' in track) {
-                  try { track.contentHint = 'music'; } catch (e) {}
+
+            const targetLabel = (window.__discordMultiSpaceAudioDeviceLabel || 'loopback').trim();
+            if (targetLabel && targetLabel !== 'loopback' && navigator.mediaDevices.getUserMedia) {
+              try {
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const cleanTarget = targetLabel.toLowerCase();
+                const matched = devices.find(d =>
+                  d.kind === 'audioinput' &&
+                  d.label &&
+                  (d.label.toLowerCase().includes(cleanTarget) || cleanTarget.includes(d.label.toLowerCase()))
+                );
+
+                if (matched && matched.deviceId) {
+                  const customStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                      deviceId: { exact: matched.deviceId },
+                      autoGainControl: false,
+                      echoCancellation: false,
+                      noiseSuppression: false,
+                      channelCount: 2
+                    }
+                  });
+                  const customTrack = customStream.getAudioTracks()[0];
+                  if (customTrack) {
+                    customTrack.enabled = true;
+                    if ('contentHint' in customTrack) {
+                      try { customTrack.contentHint = 'music'; } catch (e) {}
+                    }
+                    stream.getAudioTracks().forEach(t => {
+                      try { stream.removeTrack(t); t.stop(); } catch (e) {}
+                    });
+                    stream.addTrack(customTrack);
+                  }
                 }
-              });
+              } catch (err) {
+                console.warn('[MultiSpace] Custom audio track injection failed, retaining default loopback:', err);
+              }
+            } else {
+              const audioTracks = stream.getAudioTracks();
+              if (audioTracks && audioTracks.length > 0) {
+                audioTracks.forEach((track) => {
+                  track.enabled = true;
+                  if ('contentHint' in track) {
+                    try { track.contentHint = 'music'; } catch (e) {}
+                  }
+                });
+              }
             }
+
             return stream;
           };
         }
@@ -759,8 +799,38 @@ ipcMain.on('open-external-url', (event, url) => {
   }
 });
 
+// Helper to broadcast selected stream audio device to all active webviews
+function broadcastAudioDeviceLabelToWebviews(label) {
+  currentStreamAudioDeviceLabel = label || 'loopback';
+  try {
+    for (const wc of webContents.getAllWebContents()) {
+      if (!wc.isDestroyed() && wc.getType() === 'webview') {
+        wc.executeJavaScript(`window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(currentStreamAudioDeviceLabel)};`).catch(() => {});
+      }
+    }
+  } catch (err) {
+    log(`Failed to broadcast audio device label: ${err}`);
+  }
+}
+
+// IPC listener to set screen share audio device
+ipcMain.on('set-stream-audio-device', (event, data) => {
+  const label = typeof data === 'string' ? data : (data && (data.label || data.deviceId)) || 'loopback';
+  log(`Screen share audio device set to: "${label}"`);
+  broadcastAudioDeviceLabelToWebviews(label);
+});
+
+// IPC handler to get current stream audio device
+ipcMain.handle('get-stream-audio-device', () => {
+  return currentStreamAudioDeviceLabel;
+});
+
 // IPC listener for screen picker source selection
-ipcMain.on('screen-picker-select', (event, { requestId, sourceId, withAudio }) => {
+ipcMain.on('screen-picker-select', (event, { requestId, sourceId, withAudio, audioSourceDeviceId }) => {
+  if (audioSourceDeviceId && typeof audioSourceDeviceId === 'string') {
+    broadcastAudioDeviceLabelToWebviews(audioSourceDeviceId);
+  }
+
   const pending = pendingDisplayMediaRequests.get(requestId);
   if (!pending) {
     log(`screen-picker-select: no pending request found for [${requestId}]`);
