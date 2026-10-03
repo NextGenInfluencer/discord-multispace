@@ -15,10 +15,11 @@ let appState = {
   unreadCount: 0
 };
 
-let currentStreamAudioDeviceLabel = 'loopback';
 
 // Map to track active screen share requests: requestId -> { callback, sources, request }
 const pendingDisplayMediaRequests = new Map();
+let lastConfirmedDisplayMedia = null;
+let lastConfirmedTimestamp = 0;
 
 async function handleDisplayMediaRequest(request, callback) {
   try {
@@ -36,6 +37,21 @@ async function handleDisplayMediaRequest(request, callback) {
       log(`No display sources found for request [${requestId}]`);
       callback({});
       return;
+    }
+
+    // Deduplication / Debounce: Discord web frequently issues two rapid getDisplayMedia requests
+    // (e.g. video probe followed by active stream). Auto-fulfill if confirmed within 2 seconds.
+    const now = Date.now();
+    if (lastConfirmedDisplayMedia && (now - lastConfirmedTimestamp) < 2000) {
+      const matchingSource = sources.find((s) => s.id === lastConfirmedDisplayMedia.sourceId) || sources[0];
+      if (matchingSource) {
+        log(`Auto-fulfilling secondary display media request [${requestId}] with last source [${matchingSource.id}] "${matchingSource.name}"`);
+        callback({
+          video: matchingSource,
+          audio: lastConfirmedDisplayMedia.withAudio ? 'loopback' : undefined
+        });
+        return;
+      }
     }
 
     // Cancel any previous pending requests cleanly
@@ -255,7 +271,7 @@ function createWindow() {
     setupSession(newSession);
   });
 
-  // Code injected into Discord webviews to guarantee screen sharing includes system audio or custom mix
+  // Code injected into Discord webviews to guarantee screen sharing captures crystal-clear system audio
   const DISCORD_MEDIA_AUDIO_PATCH = `
     (() => {
       try {
@@ -265,81 +281,6 @@ function createWindow() {
         if (navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function') {
           const originalGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
           navigator.mediaDevices.getDisplayMedia = async function(constraints) {
-            const targetLabel = (window.__discordMultiSpaceAudioDeviceLabel || 'loopback').trim();
-            const audioRequested = constraints && constraints.audio !== false;
-
-            console.log('[MultiSpace] getDisplayMedia invoked. Target label:', targetLabel, 'audioRequested:', audioRequested);
-
-            // Mode A: Custom virtual audio device / mix (e.g. Voicemeeter Out B2, CABLE-A, etc.)
-            if (audioRequested && targetLabel && targetLabel !== 'loopback' && targetLabel !== 'none') {
-              try {
-                // 1. Capture screen video through Electron's desktopCapturer picker
-                const displayStream = await originalGetDisplayMedia(Object.assign({}, constraints, { audio: true }));
-
-                // 2. Stop default loopback audio track so it doesn't double or play unwanted PC sound
-                displayStream.getAudioTracks().forEach((track) => {
-                  try { track.stop(); } catch (e) {}
-                  try { displayStream.removeTrack(track); } catch (e) {}
-                });
-
-                // 3. Find the exact matching deviceId on discord.com origin by matching labels
-                const devs = await navigator.mediaDevices.enumerateDevices();
-                const cleanTarget = targetLabel.toLowerCase();
-                const match = devs.find((d) => {
-                  if (d.kind !== 'audioinput') return false;
-                  const lbl = (d.label || '').toLowerCase();
-                  if (!lbl) return false;
-                  if (lbl === cleanTarget) return true;
-                  if (lbl.includes(cleanTarget) || cleanTarget.includes(lbl)) return true;
-                  if (cleanTarget.includes('b2') && lbl.includes('b2')) return true;
-                  if (cleanTarget.includes('b1') && lbl.includes('b1')) return true;
-                  if (cleanTarget.includes('b3') && lbl.includes('b3')) return true;
-                  if (cleanTarget.includes('cable-a') && lbl.includes('cable-a')) return true;
-                  if (cleanTarget.includes('cable-b') && lbl.includes('cable-b')) return true;
-                  return false;
-                });
-
-                if (match && match.deviceId) {
-                  console.log('[MultiSpace] Found matching audio device on discord.com:', match.label, match.deviceId);
-
-                  // 4. Capture chosen stream audio device via getUserMedia in full fidelity stereo music mode
-                  const customStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                      deviceId: { exact: match.deviceId },
-                      autoGainControl: false,
-                      echoCancellation: false,
-                      noiseSuppression: false,
-                      channelCount: 2
-                    }
-                  });
-
-                  const customAudioTrack = customStream.getAudioTracks()[0];
-                  if (customAudioTrack) {
-                    customAudioTrack.enabled = true;
-                    if ('contentHint' in customAudioTrack) {
-                      try { customAudioTrack.contentHint = 'music'; } catch (e) {}
-                    }
-                    displayStream.addTrack(customAudioTrack);
-                    console.log('[MultiSpace] Attached custom audio track to screen share stream!');
-
-                    // Clean up track when screen share ends
-                    displayStream.getVideoTracks().forEach((vt) => {
-                      vt.addEventListener('ended', () => {
-                        try { customAudioTrack.stop(); } catch (e) {}
-                      });
-                    });
-                  }
-
-                  return displayStream;
-                } else {
-                  console.warn('[MultiSpace] No matching audio device found for label:', targetLabel, 'Available:', devs.map(d => d.label));
-                }
-              } catch (customErr) {
-                console.warn('[MultiSpace] Custom audio device capture failed, falling back to loopback:', customErr);
-              }
-            }
-
-            // Mode B: Standard Windows system audio loopback (or fallback)
             const safe = (typeof constraints === 'object' && constraints !== null)
               ? Object.assign({}, constraints)
               : { video: true };
@@ -818,34 +759,8 @@ ipcMain.on('open-external-url', (event, url) => {
   }
 });
 
-// IPC handler for active stream audio device selection
-ipcMain.on('set-stream-audio-device', (event, deviceLabel) => {
-  currentStreamAudioDeviceLabel = (deviceLabel && typeof deviceLabel === 'string') ? deviceLabel : 'loopback';
-  log(`Stream audio device updated to: [${currentStreamAudioDeviceLabel}]`);
-
-  // Broadcast to all windows
-  BrowserWindow.getAllWindows().forEach((win) => {
-    win.webContents.send('stream-audio-device-changed', currentStreamAudioDeviceLabel);
-  });
-
-  // Broadcast live into all Discord webviews
-  const { webContents } = require('electron');
-  webContents.getAllWebContents().forEach((wc) => {
-    if (wc.getType() === 'webview' && !wc.isDestroyed()) {
-      wc.executeJavaScript(`
-        window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(currentStreamAudioDeviceLabel)};
-        console.log('[MultiSpace] Screen share audio device live-updated to:', ${JSON.stringify(currentStreamAudioDeviceLabel)});
-      `).catch(() => {});
-    }
-  });
-});
-
-ipcMain.handle('get-stream-audio-device', () => {
-  return currentStreamAudioDeviceLabel;
-});
-
 // IPC listener for screen picker source selection
-ipcMain.on('screen-picker-select', (event, { requestId, sourceId, withAudio, audioSourceDeviceId }) => {
+ipcMain.on('screen-picker-select', (event, { requestId, sourceId, withAudio }) => {
   const pending = pendingDisplayMediaRequests.get(requestId);
   if (!pending) {
     log(`screen-picker-select: no pending request found for [${requestId}]`);
@@ -853,23 +768,11 @@ ipcMain.on('screen-picker-select', (event, { requestId, sourceId, withAudio, aud
   }
   pendingDisplayMediaRequests.delete(requestId);
 
-  if (audioSourceDeviceId) {
-    currentStreamAudioDeviceLabel = audioSourceDeviceId;
-    log(`Screen share audio source selected: [${currentStreamAudioDeviceLabel}]`);
-    const { webContents } = require('electron');
-    webContents.getAllWebContents().forEach((wc) => {
-      if (wc.getType() === 'webview' && !wc.isDestroyed()) {
-        wc.executeJavaScript(`
-          window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(currentStreamAudioDeviceLabel)};
-          console.log('[MultiSpace] Screen share audio device updated to:', ${JSON.stringify(currentStreamAudioDeviceLabel)});
-        `).catch(() => {});
-      }
-    });
-  }
-
   const selectedSource = pending.sources.find((s) => s.id === sourceId);
   if (selectedSource) {
-    log(`Screen share confirmed: source [${selectedSource.id}] "${selectedSource.name}", withAudio: ${Boolean(withAudio)} (device: ${currentStreamAudioDeviceLabel})`);
+    lastConfirmedDisplayMedia = { sourceId: selectedSource.id, withAudio: Boolean(withAudio) };
+    lastConfirmedTimestamp = Date.now();
+    log(`Screen share confirmed: source [${selectedSource.id}] "${selectedSource.name}", withAudio: ${Boolean(withAudio)}`);
     try {
       pending.callback({
         video: selectedSource,

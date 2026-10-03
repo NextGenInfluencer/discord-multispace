@@ -21,16 +21,14 @@ const ALLOWED_SEND_CHANNELS = [
   'screen-picker-select',
   'screen-picker-cancel',
   'check-for-updates',
-  'install-update-now',
-  'set-stream-audio-device'
+  'install-update-now'
 ];
 
 // Whitelist of IPC channels the renderer is allowed to invoke (request/response)
 const ALLOWED_INVOKE_CHANNELS = [
   'get-startup-setting',
   'fetch-theme-css',
-  'get-app-version',
-  'get-stream-audio-device'
+  'get-app-version'
 ];
 
 // Whitelist of IPC channels the renderer is allowed to listen on

@@ -403,25 +403,11 @@
           </div>
         </div>
 
-        <!-- Screen Share Audio Routing Section -->
-        <div class="settings-section-divider" style="margin-top: 18px;"></div>
-        <div class="settings-section-header">
-          <span class="modal-label">SCREEN SHARE AUDIO SOURCE</span>
-        </div>
-        <p class="settings-toggle-desc" style="margin-top: 4px; margin-bottom: 8px;">
-          Choose which audio device/mix to stream to Discord. For VoiceMeeter setups, select <strong>Voicemeeter Out B2</strong> to stream games, Spotify, and YouTube without echo.
-        </p>
-        <div style="margin-bottom: 6px;">
-          <select id="select-stream-audio-source" class="modal-select" style="width: 100%;">
-            <option value="loopback">Default (Windows System Audio Loopback)</option>
-          </select>
-        </div>
-
         <!-- Software Updates Section -->
         <div class="settings-section-divider" style="margin-top: 18px;"></div>
         <div class="settings-section-header">
           <span class="modal-label">APPLICATION UPDATES</span>
-          <span id="updater-version-tag" class="theme-active-status">v1.1.5</span>
+          <span id="updater-version-tag" class="theme-active-status">v1.1.8</span>
         </div>
         <div class="updater-card">
           <div class="updater-info">
@@ -494,12 +480,9 @@
             <input type="checkbox" id="screen-picker-audio-toggle" checked />
             <span class="screen-picker-audio-label">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>
-              Share Audio:
+              Share System Audio
             </span>
           </label>
-          <select id="screen-picker-audio-device-select" class="screen-picker-audio-select" title="Select Audio Source Device">
-            <option value="loopback">Default System Audio</option>
-          </select>
         </div>
         <div class="screen-picker-actions">
           <button type="button" id="btn-screen-picker-cancel" class="btn-secondary">Cancel</button>
