@@ -2349,17 +2349,33 @@ async function populateStreamAudioDevices() {
       selectEl.appendChild(defOpt);
 
       audioInputs.forEach((dev) => {
-        if (!dev.deviceId) return;
+        const label = dev.label || (dev.deviceId ? `Audio Device (${dev.deviceId.slice(0, 8)}...)` : '');
+        if (!label) return;
         const opt = document.createElement('option');
-        opt.value = dev.deviceId;
-        opt.textContent = dev.label || `Audio Device (${dev.deviceId.slice(0, 8)}...)`;
+        // Store the human-readable label because labels are consistent across origins,
+        // unlike deviceId hashes which are randomized per origin by Chromium.
+        opt.value = label;
+        opt.textContent = label;
         selectEl.appendChild(opt);
       });
 
       selectEl.value = currentStreamAudioDevice;
       if (selectEl.value !== currentStreamAudioDevice) {
-        selectEl.value = 'loopback';
-        currentStreamAudioDevice = 'loopback';
+        // Check if there is a partial label match (e.g. if name changed slightly)
+        let found = false;
+        for (let i = 0; i < selectEl.options.length; i++) {
+          if (selectEl.options[i].value && currentStreamAudioDevice && 
+             (selectEl.options[i].value.includes(currentStreamAudioDevice) || currentStreamAudioDevice.includes(selectEl.options[i].value))) {
+            selectEl.selectedIndex = i;
+            currentStreamAudioDevice = selectEl.options[i].value;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          selectEl.value = 'loopback';
+          currentStreamAudioDevice = 'loopback';
+        }
       }
     };
 
@@ -2370,25 +2386,25 @@ async function populateStreamAudioDevices() {
   }
 }
 
+function handleStreamAudioDeviceSelection(newVal) {
+  currentStreamAudioDevice = newVal || 'loopback';
+  localStorage.setItem(STORAGE_STREAM_AUDIO_DEVICE, currentStreamAudioDevice);
+  if (selectStreamAudioSource) selectStreamAudioSource.value = currentStreamAudioDevice;
+  if (screenPickerAudioDeviceSelect) screenPickerAudioDeviceSelect.value = currentStreamAudioDevice;
+  if (eAPI && typeof eAPI.send === 'function') {
+    eAPI.send('set-stream-audio-device', currentStreamAudioDevice);
+  }
+}
+
 if (selectStreamAudioSource) {
   selectStreamAudioSource.addEventListener('change', () => {
-    currentStreamAudioDevice = selectStreamAudioSource.value;
-    localStorage.setItem(STORAGE_STREAM_AUDIO_DEVICE, currentStreamAudioDevice);
-    if (screenPickerAudioDeviceSelect) screenPickerAudioDeviceSelect.value = currentStreamAudioDevice;
-    if (eAPI && typeof eAPI.send === 'function') {
-      eAPI.send('set-stream-audio-device', currentStreamAudioDevice);
-    }
+    handleStreamAudioDeviceSelection(selectStreamAudioSource.value);
   });
 }
 
 if (screenPickerAudioDeviceSelect) {
   screenPickerAudioDeviceSelect.addEventListener('change', () => {
-    currentStreamAudioDevice = screenPickerAudioDeviceSelect.value;
-    localStorage.setItem(STORAGE_STREAM_AUDIO_DEVICE, currentStreamAudioDevice);
-    if (selectStreamAudioSource) selectStreamAudioSource.value = currentStreamAudioDevice;
-    if (eAPI && typeof eAPI.send === 'function') {
-      eAPI.send('set-stream-audio-device', currentStreamAudioDevice);
-    }
+    handleStreamAudioDeviceSelection(screenPickerAudioDeviceSelect.value);
   });
 }
 
