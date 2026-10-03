@@ -195,7 +195,8 @@ function setupSession(targetSession) {
       'camera',
       'clipboard-read',
       'clipboard-sanitized-write',
-      'display-capture'
+      'display-capture',
+      'speaker-selection'
     ];
     if (allowedPermissions.includes(permission)) {
       callback(true);
@@ -213,7 +214,8 @@ function setupSession(targetSession) {
       'notifications',
       'microphone',
       'camera',
-      'display-capture'
+      'display-capture',
+      'speaker-selection'
     ];
     return allowedPermissions.includes(permission);
   });
