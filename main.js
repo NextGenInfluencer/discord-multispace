@@ -15,6 +15,8 @@ let appState = {
   unreadCount: 0
 };
 
+let currentStreamAudioDeviceId = 'loopback';
+
 // Map to track active screen share requests: requestId -> { callback, sources, request }
 const pendingDisplayMediaRequests = new Map();
 
@@ -253,7 +255,7 @@ function createWindow() {
     setupSession(newSession);
   });
 
-  // Code injected into Discord webviews to guarantee screen sharing includes system audio loopback
+  // Code injected into Discord webviews to guarantee screen sharing includes system audio or custom mix
   const DISCORD_MEDIA_AUDIO_PATCH = `
     (() => {
       try {
@@ -263,11 +265,59 @@ function createWindow() {
         if (navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function') {
           const originalGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
           navigator.mediaDevices.getDisplayMedia = async function(constraints) {
+            const targetDevId = window.__discordMultiSpaceAudioDeviceId || 'loopback';
+            const audioRequested = constraints && constraints.audio !== false;
+
+            // Mode A: Custom virtual audio device / mix (e.g. Voicemeeter Out B2, CABLE Output)
+            if (audioRequested && targetDevId && targetDevId !== 'loopback' && targetDevId !== 'none') {
+              try {
+                // 1. Capture screen video
+                const videoStream = await originalGetDisplayMedia({
+                  video: (constraints && constraints.video) ? constraints.video : true,
+                  audio: false
+                });
+
+                // 2. Capture custom stream audio device via getUserMedia in high-fidelity music mode
+                const audioStream = await navigator.mediaDevices.getUserMedia({
+                  audio: {
+                    deviceId: { exact: targetDevId },
+                    autoGainControl: false,
+                    echoCancellation: false,
+                    noiseSuppression: false
+                  }
+                });
+
+                // 3. Combine video and custom audio into a unified MediaStream
+                const combined = new MediaStream();
+                videoStream.getVideoTracks().forEach((vt) => combined.addTrack(vt));
+                audioStream.getAudioTracks().forEach((at) => {
+                  at.enabled = true;
+                  if ('contentHint' in at) {
+                    try { at.contentHint = 'music'; } catch (e) {}
+                  }
+                  combined.addTrack(at);
+                });
+
+                // Stop custom audio track when video stream ends
+                videoStream.getVideoTracks().forEach((vt) => {
+                  vt.addEventListener('ended', () => {
+                    audioStream.getAudioTracks().forEach((at) => {
+                      try { at.stop(); } catch (e) {}
+                    });
+                  });
+                });
+
+                return combined;
+              } catch (customErr) {
+                console.warn('[MultiSpace] Custom audio device capture failed, falling back to loopback:', customErr);
+              }
+            }
+
+            // Mode B: Standard Windows system audio loopback (or fallback)
             const safe = (typeof constraints === 'object' && constraints !== null)
               ? Object.assign({}, constraints)
               : { video: true };
 
-            // Ensure system audio loopback is always requested in constraints
             if (!safe.audio || typeof safe.audio !== 'object') {
               safe.audio = {
                 autoGainControl: false,
@@ -310,6 +360,7 @@ function createWindow() {
       const injectBridge = () => {
         if (!contents.isDestroyed()) {
           contents.executeJavaScript(DISCORD_MEDIA_AUDIO_PATCH).catch(() => {});
+          contents.executeJavaScript(`window.__discordMultiSpaceAudioDeviceId = ${JSON.stringify(currentStreamAudioDeviceId)};`).catch(() => {});
         }
       };
       contents.on('dom-ready', injectBridge);
@@ -741,8 +792,30 @@ ipcMain.on('open-external-url', (event, url) => {
   }
 });
 
+// IPC handler for active stream audio device selection
+ipcMain.on('set-stream-audio-device', (event, deviceId) => {
+  currentStreamAudioDeviceId = deviceId || 'loopback';
+  log(`Stream audio device updated to: [${currentStreamAudioDeviceId}]`);
+
+  // Broadcast to all webviews
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.executeJavaScript(`
+      window.__discordMultiSpaceAudioDeviceId = ${JSON.stringify(currentStreamAudioDeviceId)};
+      document.querySelectorAll('webview').forEach(wv => {
+        try {
+          wv.executeJavaScript("window.__discordMultiSpaceAudioDeviceId = " + ${JSON.stringify(JSON.stringify(currentStreamAudioDeviceId))} + ";").catch(() => {});
+        } catch(e) {}
+      });
+    `).catch(() => {});
+  }
+});
+
+ipcMain.handle('get-stream-audio-device', () => {
+  return currentStreamAudioDeviceId;
+});
+
 // IPC listener for screen picker source selection
-ipcMain.on('screen-picker-select', (event, { requestId, sourceId, withAudio }) => {
+ipcMain.on('screen-picker-select', (event, { requestId, sourceId, withAudio, audioSourceDeviceId }) => {
   const pending = pendingDisplayMediaRequests.get(requestId);
   if (!pending) {
     log(`screen-picker-select: no pending request found for [${requestId}]`);
@@ -750,9 +823,24 @@ ipcMain.on('screen-picker-select', (event, { requestId, sourceId, withAudio }) =
   }
   pendingDisplayMediaRequests.delete(requestId);
 
+  if (audioSourceDeviceId) {
+    currentStreamAudioDeviceId = audioSourceDeviceId;
+    log(`Screen share audio source selected: [${currentStreamAudioDeviceId}]`);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.executeJavaScript(`
+        window.__discordMultiSpaceAudioDeviceId = ${JSON.stringify(currentStreamAudioDeviceId)};
+        document.querySelectorAll('webview').forEach(wv => {
+          try {
+            wv.executeJavaScript("window.__discordMultiSpaceAudioDeviceId = " + ${JSON.stringify(JSON.stringify(currentStreamAudioDeviceId))} + ";").catch(() => {});
+          } catch(e) {}
+        });
+      `).catch(() => {});
+    }
+  }
+
   const selectedSource = pending.sources.find((s) => s.id === sourceId);
   if (selectedSource) {
-    log(`Screen share confirmed: source [${selectedSource.id}] "${selectedSource.name}", withAudio: ${Boolean(withAudio)}`);
+    log(`Screen share confirmed: source [${selectedSource.id}] "${selectedSource.name}", withAudio: ${Boolean(withAudio)} (device: ${currentStreamAudioDeviceId})`);
     try {
       pending.callback({
         video: selectedSource,

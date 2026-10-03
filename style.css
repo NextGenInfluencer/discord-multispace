@@ -1724,6 +1724,47 @@ input:checked + .slider:before {
   color: var(--accent-green);
 }
 
+.screen-picker-audio-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.screen-picker-audio-select {
+  background-color: var(--bg-input);
+  color: var(--text-header);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
+  cursor: pointer;
+  max-width: 220px;
+  transition: border-color 0.15s ease;
+}
+
+.screen-picker-audio-select:focus {
+  border-color: var(--accent-blurple);
+}
+
+.modal-select {
+  background-color: var(--bg-input);
+  color: var(--text-header);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  cursor: pointer;
+  box-sizing: border-box;
+}
+
+.modal-select:focus {
+  border-color: var(--accent-blurple);
+}
+
 .screen-picker-actions {
   display: flex;
   align-items: center;
