@@ -22,6 +22,7 @@ const {
   redactSensitiveUrl,
   parseAndValidateProxy,
   safeFetchThemeCss,
+  resolveThemeCssImports,
   transformDiscordCspHeader,
   isTrustedDiscordOrigin,
   classifyNavigationUrl,
@@ -46,6 +47,7 @@ let tray = null;
 let mainWindow = null;
 let hudView = null;
 let hudHideTimer = null;
+let hudCurrentKind = null;
 
 const appState = {
   accountCount: 1,
@@ -62,10 +64,8 @@ let mainSettings = {
 // Account WebContentsViews: accountId -> entry
 const accountViews = new Map();
 
-// Session -> { username, password } for HTTP 407 proxy authentication
-const proxyAuthBySession = new WeakMap();
-// Bounded map to avoid infinite 407 auth retry loops on bad credentials
-const proxyAuthAttempts = new Map();
+// Session -> { username, password, recentAttempts: Map<string, { count, lastTs }> } for HTTP 407 proxy auth
+const proxyAuthStateBySession = new WeakMap();
 
 // Layout & overlay state synced from renderer
 const layoutState = {
@@ -76,14 +76,18 @@ const layoutState = {
   containerRect: { x: 72, y: 0, width: 1208, height: 800 },
   overlayBlocked: false
 };
+let overlayBlockSeq = 0;
 
 // Theme state
 let isCustomThemeActive = false;
 let currentResolvedThemeCss = '';
 
-// Boss key & global deafen state
+// Boss key & global audio state
 let isBossKeyMuted = false;
 const audioMuteStateBeforeBossKey = new Map();
+const childAudioMuteStateBeforeBossKey = new WeakMap();
+const childWindowsHiddenByBossKey = new Set();
+let globalMutedState = false;
 let globalDeafenedState = false;
 
 // Screen share state
@@ -383,6 +387,20 @@ function setupSession(targetSession) {
     } catch (err) {
       log(`Failed to attach onHeadersReceived on session: ${err}`);
     }
+
+    // Clear per-session 407 failure counters whenever a proxied request succeeds (non-407)
+    if (typeof targetSession.webRequest.onResponseStarted === 'function') {
+      try {
+        targetSession.webRequest.onResponseStarted({ urls: ['*://*/*'] }, (details) => {
+          if (details && details.statusCode !== 407) {
+            const authState = proxyAuthStateBySession.get(targetSession);
+            if (authState && authState.recentAttempts.size > 0) {
+              authState.recentAttempts.clear();
+            }
+          }
+        });
+      } catch {}
+    }
   }
 
   if (typeof targetSession.setDisplayMediaRequestHandler === 'function') {
@@ -407,33 +425,36 @@ app.on('session-created', (newSession) => {
   setupSession(newSession);
 });
 
-// HTTP 407 Proxy Authentication Handler
+// HTTP 407 Proxy Authentication Handler (Per-Session Scoped & Auto-Resetting on Success)
 app.on('login', (event, wc, authenticationResponseDetails, authInfo, callback) => {
-  if (!authInfo || !authInfo.isProxy || !wc || wc.isDestroyed()) {
+  if (!authInfo || !authInfo.isProxy || !wc || wc.isDestroyed() || !wc.session) {
     return;
   }
 
-  const creds = proxyAuthBySession.get(wc.session);
-  if (!creds) {
+  const authState = proxyAuthStateBySession.get(wc.session);
+  if (!authState) {
     return;
   }
 
-  const key = `${wc.session ? 'ses' : 'none'}:${(authenticationResponseDetails && authenticationResponseDetails.url) || ''}:${authInfo.host}:${authInfo.port}`;
-  const attempts = (proxyAuthAttempts.get(key) || 0) + 1;
-  if (proxyAuthAttempts.size > 500) {
-    proxyAuthAttempts.clear();
+  const now = Date.now();
+  const key = `${authInfo.host}:${authInfo.port}:${(authenticationResponseDetails && authenticationResponseDetails.url) || ''}`;
+  const prev = authState.recentAttempts.get(key);
+  const attempts = (!prev || (now - prev.lastTs) > 4000) ? 1 : prev.count + 1;
+
+  if (authState.recentAttempts.size > 250) {
+    authState.recentAttempts.clear();
   }
-  proxyAuthAttempts.set(key, attempts);
+  authState.recentAttempts.set(key, { count: attempts, lastTs: now });
 
   if (attempts > 2) {
-    log(`Proxy authentication failed after ${attempts - 1} attempts for ${authInfo.host}:${authInfo.port}`);
-    proxyAuthAttempts.delete(key);
+    log(`Proxy authentication failed after ${attempts - 1} rapid attempts for ${authInfo.host}:${authInfo.port}`);
+    authState.recentAttempts.delete(key);
     callback();
     return;
   }
 
   event.preventDefault();
-  callback(creds.username, creds.password);
+  callback(authState.username, authState.password);
 });
 
 app.on('web-contents-created', (_event, contents) => {
@@ -573,6 +594,13 @@ function broadcastAudioDeviceLabelToViews(label) {
     if (!wc.isDestroyed()) {
       wc.executeJavaScript(`window.__discordMultiSpaceAudioDeviceLabel = ${payload};`).catch(() => {});
     }
+    if (entry.childWindows) {
+      for (const childWin of entry.childWindows) {
+        if (childWin && !childWin.isDestroyed() && !childWin._isOAuthPopup && !childWin.webContents.isDestroyed()) {
+          childWin.webContents.executeJavaScript(`window.__discordMultiSpaceAudioDeviceLabel = ${payload};`).catch(() => {});
+        }
+      }
+    }
   }
 }
 
@@ -587,7 +615,7 @@ async function configureAccountSessionProxy(accountId, rawProxy) {
   const parsed = parseAndValidateProxy(rawProxy);
   if (!parsed.valid) {
     // Fail-closed: bind invalid proxy to dead loopback port 1 so traffic NEVER leaks over DIRECT
-    proxyAuthBySession.delete(targetSession);
+    proxyAuthStateBySession.delete(targetSession);
     await targetSession.setProxy({
       proxyRules: 'http://127.0.0.1:1',
       proxyBypassRules: '<-loopback>'
@@ -598,7 +626,7 @@ async function configureAccountSessionProxy(accountId, rawProxy) {
   }
 
   if (parsed.mode === 'direct') {
-    proxyAuthBySession.delete(targetSession);
+    proxyAuthStateBySession.delete(targetSession);
     await targetSession.setProxy({ proxyRules: '' });
     await targetSession.closeAllConnections();
     if (typeof targetSession.forceReloadProxyConfig === 'function') {
@@ -609,9 +637,13 @@ async function configureAccountSessionProxy(accountId, rawProxy) {
   }
 
   if (parsed.auth) {
-    proxyAuthBySession.set(targetSession, parsed.auth);
+    proxyAuthStateBySession.set(targetSession, {
+      username: parsed.auth.username,
+      password: parsed.auth.password,
+      recentAttempts: new Map()
+    });
   } else {
-    proxyAuthBySession.delete(targetSession);
+    proxyAuthStateBySession.delete(targetSession);
   }
 
   await targetSession.setProxy({
@@ -672,6 +704,23 @@ const HUD_HTML = `<!DOCTYPE html>
 <body><div id="root"></div></body>
 </html>`;
 
+function focusActiveDiscordViewOrShell() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const focusId = layoutState.isSplitView ? layoutState.splitPrimaryId : layoutState.activeAccountId;
+  const entry = focusId ? accountViews.get(focusId) : null;
+  if (!layoutState.overlayBlocked && entry && !entry.hasError && entry.view.getVisible() && !entry.view.webContents.isDestroyed()) {
+    try {
+      entry.view.webContents.focus();
+      return;
+    } catch {}
+  }
+  if (!mainWindow.webContents.isDestroyed()) {
+    try {
+      mainWindow.webContents.focus();
+    } catch {}
+  }
+}
+
 function createHudView() {
   if (!mainWindow || mainWindow.isDestroyed() || hudView) return;
   hudView = new WebContentsView({
@@ -686,22 +735,30 @@ function createHudView() {
   hudView.setBounds({ x: 0, y: 0, width: 0, height: 0 });
   mainWindow.contentView.addChildView(hudView);
   hudView.webContents.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(HUD_HTML)}`).catch(() => {});
+
+  // Never allow clicking a transient HUD pill to steal keyboard focus from Discord
+  hudView.webContents.on('focus', () => {
+    hideHudView();
+    focusActiveDiscordViewOrShell();
+  });
 }
 
 function hideHudView() {
   clearTimeout(hudHideTimer);
   hudHideTimer = null;
+  hudCurrentKind = null;
   if (hudView && !hudView.webContents.isDestroyed()) {
     hudView.setVisible(false);
     hudView.setBounds({ x: 0, y: 0, width: 0, height: 0 });
   }
 }
 
-function showHudCard({ x, y, width, height, htmlPayload, autoHideMs = 0 }) {
+function showHudCard({ kind = 'pill', x, y, width, height, htmlPayload, autoHideMs = 0 }) {
   if (!hudView || hudView.webContents.isDestroyed() || !mainWindow || mainWindow.isDestroyed()) return;
   if (layoutState.overlayBlocked) return;
 
   clearTimeout(hudHideTimer);
+  hudCurrentKind = kind;
   // Ensure hudView is topmost child
   mainWindow.contentView.addChildView(hudView);
   hudView.setBounds({
@@ -929,31 +986,67 @@ function attachNavigationAndShortcutHandlers(entry) {
     return { action: 'deny' };
   });
 
-  // Ensure any child window (popout / OAuth) has safe navigation guards
+  // Ensure any child window (popout / OAuth) inherits WebRTC IP protection, Boss Key / Deafen mute, and navigation/redirect guards
   wc.on('did-create-window', (childWin, createDetails) => {
     const isOAuth = classifyPopupRequest(createDetails).action === 'allow-oauth';
-    childWin.webContents.setWindowOpenHandler(({ url }) => {
+    childWin._isOAuthPopup = isOAuth;
+    if (entry.childWindows) {
+      entry.childWindows.add(childWin);
+      childWin.on('closed', () => {
+        entry.childWindows.delete(childWin);
+        childWindowsHiddenByBossKey.delete(childWin);
+      });
+    }
+
+    const childWc = childWin.webContents;
+    childWc.setWebRTCIPHandlingPolicy(entry.hasProxy ? 'disable_non_proxied_udp' : 'default');
+    if (isBossKeyMuted || globalDeafenedState) {
+      childWc.setAudioMuted(true);
+    }
+    if (isBossKeyMuted && childWin.isVisible()) {
+      childWindowsHiddenByBossKey.add(childWin);
+      childWin.hide();
+    }
+
+    childWc.setWindowOpenHandler(({ url }) => {
       if (typeof url === 'string' && (url.startsWith('https://') || url.startsWith('http://'))) {
         shell.openExternal(url).catch(() => {});
       }
       return { action: 'deny' };
     });
-    childWin.webContents.on('will-navigate', (navDetails) => {
+
+    const enforceChildNavGuard = (navDetails) => {
       if (navDetails.isMainFrame === false) return;
       const u = navDetails.url || '';
       if (isOAuth) {
         // OAuth flows redirect across HTTPS identity providers (Spotify, GitHub, etc.) back to discord.com
+        if (IS_TEST_MODE && u.startsWith(DISCORD_APP_URL.split('/app')[0])) return;
         if (!u.startsWith('https://')) {
           navDetails.preventDefault();
         }
         return;
       }
+      if (IS_TEST_MODE && u.startsWith(DISCORD_APP_URL.split('/app')[0])) return;
       const dec = classifyNavigationUrl(u);
       if (!dec.allow && u !== 'about:blank') {
         navDetails.preventDefault();
         if (dec.openExternal) shell.openExternal(u).catch(() => {});
       }
-    });
+    };
+
+    childWc.on('will-navigate', enforceChildNavGuard);
+    childWc.on('will-redirect', enforceChildNavGuard);
+
+    if (!isOAuth) {
+      attachContextMenu(childWc);
+      childWc.on('dom-ready', () => {
+        if (childWc.isDestroyed()) return;
+        childWc.executeJavaScript(DISCORD_MEDIA_AUDIO_PATCH).catch(() => {});
+        childWc.executeJavaScript(
+          `window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`
+        ).catch(() => {});
+      });
+    }
   });
 
   attachContextMenu(wc);
@@ -966,6 +1059,7 @@ async function pollViewNotifications(entry) {
     const title = wc.getTitle();
     const fromTitle = parseDiscordTitleUnread(title);
     if (fromTitle !== null) {
+      entry.lastBadge = fromTitle;
       sendToRenderer('view:notification-updated', { accountId: entry.id, badge: fromTitle });
       return;
     }
@@ -995,7 +1089,9 @@ async function pollViewNotifications(entry) {
     `);
 
     if (typeof domRes === 'string' || typeof domRes === 'number') {
-      sendToRenderer('view:notification-updated', { accountId: entry.id, badge: domRes || null });
+      const nextBadge = domRes || null;
+      entry.lastBadge = nextBadge;
+      sendToRenderer('view:notification-updated', { accountId: entry.id, badge: nextBadge });
     }
   } catch {}
 }
@@ -1012,10 +1108,11 @@ async function ensureAccountView(account) {
     return { ok: false, error: 'Invalid account ID.' };
   }
 
+  const normalizedProxyRaw = typeof account.proxy === 'string' ? account.proxy.trim() : '';
   let entry = accountViews.get(accountId);
-  const proxyResult = await configureAccountSessionProxy(accountId, account.proxy || '');
 
   if (!entry || entry.view.webContents.isDestroyed()) {
+    const proxyResult = await configureAccountSessionProxy(accountId, normalizedProxyRaw);
     const partition = partitionForAccountId(accountId);
     const view = new WebContentsView({
       webPreferences: {
@@ -1045,12 +1142,17 @@ async function ensureAccountView(account) {
       view,
       zoomFactor: initialZoom,
       hasError: false,
+      lastErrorCode: null,
+      lastErrorDescription: null,
       pendingMainLoadFailed: false,
       isLoading: false,
+      lastBadge: null,
       insertedCssKey: null,
       hibernationCssKey: null,
       isHibernated: false,
-      hasProxy: proxyResult.hasProxy
+      hasProxy: proxyResult.hasProxy,
+      appliedProxyRaw: normalizedProxyRaw,
+      childWindows: new Set()
     };
     accountViews.set(accountId, entry);
 
@@ -1088,6 +1190,8 @@ async function ensureAccountView(account) {
       if (errorCode !== -3 && isMainFrame !== false) {
         entry.pendingMainLoadFailed = true;
         entry.hasError = true;
+        entry.lastErrorCode = errorCode;
+        entry.lastErrorDescription = errorDescription || 'ERR_CONNECTION_FAILED';
         layoutViews();
         sendToRenderer('view:did-fail-load', { accountId, errorCode, errorDescription });
       }
@@ -1100,6 +1204,8 @@ async function ensureAccountView(account) {
       }
       if (entry.hasError) {
         entry.hasError = false;
+        entry.lastErrorCode = null;
+        entry.lastErrorDescription = null;
         layoutViews();
         sendToRenderer('view:did-recover-load', { accountId });
       }
@@ -1126,7 +1232,12 @@ async function ensureAccountView(account) {
 
     wc.on('page-title-updated', (_event, title) => {
       const badge = parseDiscordTitleUnread(title);
-      sendToRenderer('view:notification-updated', { accountId, badge });
+      if (badge !== null) {
+        entry.lastBadge = badge;
+        sendToRenderer('view:notification-updated', { accountId, badge });
+      } else {
+        pollViewNotifications(entry);
+      }
     });
 
     attachNavigationAndShortcutHandlers(entry);
@@ -1137,6 +1248,8 @@ async function ensureAccountView(account) {
 
     if (!proxyResult.ok) {
       entry.hasError = true;
+      entry.lastErrorCode = 'ERR_INVALID_PROXY_CONFIG';
+      entry.lastErrorDescription = proxyResult.error;
       layoutViews();
       sendToRenderer('view:did-fail-load', {
         accountId,
@@ -1147,14 +1260,31 @@ async function ensureAccountView(account) {
     }
 
     wc.loadURL(DISCORD_APP_URL).catch(() => {});
-  } else {
-    entry.hasProxy = proxyResult.hasProxy;
-    entry.view.webContents.setWebRTCIPHandlingPolicy(
-      proxyResult.hasProxy ? 'disable_non_proxied_udp' : 'default'
-    );
+    return proxyResult;
   }
 
-  return proxyResult;
+  // Existing live view: only reconfigure proxy / sever sockets if the proxy string actually changed!
+  if (entry.appliedProxyRaw !== normalizedProxyRaw) {
+    const proxyResult = await configureAccountSessionProxy(accountId, normalizedProxyRaw);
+    entry.appliedProxyRaw = normalizedProxyRaw;
+    entry.hasProxy = proxyResult.hasProxy;
+    const policy = proxyResult.hasProxy ? 'disable_non_proxied_udp' : 'default';
+    entry.view.webContents.setWebRTCIPHandlingPolicy(policy);
+    if (entry.childWindows) {
+      for (const childWin of entry.childWindows) {
+        if (childWin && !childWin.isDestroyed() && !childWin.webContents.isDestroyed()) {
+          childWin.webContents.setWebRTCIPHandlingPolicy(policy);
+        }
+      }
+    }
+    return proxyResult;
+  }
+
+  return {
+    ok: entry.lastErrorCode !== 'ERR_INVALID_PROXY_CONFIG',
+    hasProxy: entry.hasProxy,
+    error: entry.lastErrorCode === 'ERR_INVALID_PROXY_CONFIG' ? entry.lastErrorDescription : undefined
+  };
 }
 
 function wakeEntryIfHibernated(entry) {
@@ -1219,6 +1349,8 @@ function reloadAccountView(accountId, ignoreCache = false) {
   if (!entry || entry.view.webContents.isDestroyed()) return;
   entry.pendingMainLoadFailed = false;
   entry.hasError = false;
+  entry.lastErrorCode = null;
+  entry.lastErrorDescription = null;
   layoutViews();
   sendToRenderer('view:did-recover-load', { accountId });
   const wc = entry.view.webContents;
@@ -1235,6 +1367,17 @@ function reloadAccountView(accountId, ignoreCache = false) {
 async function destroyAccountView(accountId, wipeSessionData = true) {
   const entry = accountViews.get(accountId);
   if (entry) {
+    if (entry.childWindows) {
+      for (const childWin of Array.from(entry.childWindows)) {
+        try {
+          childWindowsHiddenByBossKey.delete(childWin);
+          if (childWin && !childWin.isDestroyed()) {
+            childWin.destroy();
+          }
+        } catch {}
+      }
+      entry.childWindows.clear();
+    }
     try {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.contentView.removeChildView(entry.view);
@@ -1251,7 +1394,7 @@ async function destroyAccountView(accountId, wipeSessionData = true) {
 
   const partition = partitionForAccountId(accountId);
   const ses = session.fromPartition(partition);
-  proxyAuthBySession.delete(ses);
+  proxyAuthStateBySession.delete(ses);
 
   if (wipeSessionData) {
     try {
@@ -1267,19 +1410,36 @@ async function destroyAccountView(accountId, wipeSessionData = true) {
 }
 
 // ============================================================================
-// Boss Key & Audio State Restoration (Never Locks Accounts Muted)
+// Boss Key & Audio State Restoration (Includes Pop-Out Windows & Deafen Independence)
 // ============================================================================
 function restoreFromBossKeyIfNeeded() {
   if (!isBossKeyMuted) return;
   isBossKeyMuted = false;
   for (const [id, entry] of accountViews.entries()) {
     const wc = entry.view.webContents;
-    if (wc.isDestroyed()) continue;
-    const prevMuted = audioMuteStateBeforeBossKey.get(id);
-    wc.setAudioMuted(Boolean(prevMuted) || globalDeafenedState);
+    if (!wc.isDestroyed()) {
+      const prevIndependentMute = audioMuteStateBeforeBossKey.get(id);
+      wc.setAudioMuted(Boolean(prevIndependentMute) || globalDeafenedState);
+    }
+    if (entry.childWindows) {
+      for (const childWin of entry.childWindows) {
+        if (childWin && !childWin.isDestroyed() && !childWin.webContents.isDestroyed()) {
+          const prevChildMute = childAudioMuteStateBeforeBossKey.get(childWin);
+          childWin.webContents.setAudioMuted(Boolean(prevChildMute) || globalDeafenedState);
+        }
+      }
+    }
   }
+  for (const childWin of Array.from(childWindowsHiddenByBossKey)) {
+    if (childWin && !childWin.isDestroyed()) {
+      try {
+        childWin.showInactive();
+      } catch {}
+    }
+  }
+  childWindowsHiddenByBossKey.clear();
   audioMuteStateBeforeBossKey.clear();
-  log('Boss Key audio state restored');
+  log('Boss Key audio & pop-out window state restored');
 }
 
 function handleBossKey() {
@@ -1287,25 +1447,40 @@ function handleBossKey() {
   if (mainWindow.isVisible()) {
     if (!isBossKeyMuted) {
       audioMuteStateBeforeBossKey.clear();
+      childWindowsHiddenByBossKey.clear();
       for (const [id, entry] of accountViews.entries()) {
         const wc = entry.view.webContents;
         if (!wc.isDestroyed()) {
-          audioMuteStateBeforeBossKey.set(id, wc.isAudioMuted());
+          audioMuteStateBeforeBossKey.set(id, wc.isAudioMuted() && !globalDeafenedState);
           wc.setAudioMuted(true);
+        }
+        if (entry.childWindows) {
+          for (const childWin of entry.childWindows) {
+            if (childWin && !childWin.isDestroyed()) {
+              if (!childWin.webContents.isDestroyed()) {
+                childAudioMuteStateBeforeBossKey.set(childWin, childWin.webContents.isAudioMuted() && !globalDeafenedState);
+                childWin.webContents.setAudioMuted(true);
+              }
+              if (childWin.isVisible()) {
+                childWindowsHiddenByBossKey.add(childWin);
+                childWin.hide();
+              }
+            }
+          }
         }
       }
       isBossKeyMuted = true;
     }
     mainWindow.hide();
     updateTrayMenu();
-    log('Emergency Boss Key triggered: window hidden to tray & audio muted');
+    log('Emergency Boss Key triggered: windows hidden to tray & audio muted');
   } else {
     mainWindow.show();
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
     restoreFromBossKeyIfNeeded();
     updateTrayMenu();
-    log('Emergency Boss Key triggered: window restored & audio unmuted');
+    log('Emergency Boss Key triggered: windows restored & audio unmuted');
   }
 }
 
@@ -1403,6 +1578,14 @@ function createWindow() {
 
   createHudView();
 
+  mainWindow.webContents.on('did-finish-load', () => {
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
+    try {
+      mainWindow.webContents.setZoomFactor(1.0);
+      mainWindow.webContents.setVisualZoomLevelLimits(1, 1);
+    } catch {}
+  });
+
   mainWindow.loadFile(path.join(__dirname, 'index.html')).then(() => {
     log('mainWindow.loadFile completed');
   }).catch((err) => {
@@ -1434,6 +1617,12 @@ function createWindow() {
   mainWindow.on('hide', () => {
     hideHudView();
     updateTrayMenu();
+  });
+
+  mainWindow.on('blur', () => {
+    if (hudCurrentKind === 'tooltip') {
+      hideHudView();
+    }
   });
 }
 
@@ -1562,7 +1751,28 @@ ipcMain.handle('views:sync-accounts', async (event, payload) => {
   }
 
   layoutViews();
-  return { ok: true, proxyErrors };
+
+  const viewStates = {};
+  for (const [id, entry] of accountViews.entries()) {
+    viewStates[id] = {
+      hasError: Boolean(entry.hasError),
+      errorCode: entry.lastErrorCode,
+      errorDescription: entry.lastErrorDescription,
+      isLoading: Boolean(entry.isLoading),
+      badge: entry.lastBadge || null,
+      isHibernated: Boolean(entry.isHibernated)
+    };
+  }
+
+  return {
+    ok: true,
+    proxyErrors,
+    viewStates,
+    audioState: {
+      isMutedAll: Boolean(globalMutedState),
+      isDeafenedAll: Boolean(globalDeafenedState)
+    }
+  };
 });
 
 ipcMain.handle('views:update-account-proxy', async (event, payload) => {
@@ -1574,19 +1784,30 @@ ipcMain.handle('views:update-account-proxy', async (event, payload) => {
     return { ok: false, error: 'Invalid account ID' };
   }
 
-  const validation = parseAndValidateProxy(proxy || '');
+  const normalizedProxy = typeof proxy === 'string' ? proxy.trim() : '';
+  const validation = parseAndValidateProxy(normalizedProxy);
   if (!validation.valid) {
     return { ok: false, error: validation.error };
   }
 
-  const res = await configureAccountSessionProxy(accountId, proxy || '');
+  const res = await configureAccountSessionProxy(accountId, normalizedProxy);
   const entry = accountViews.get(accountId);
   if (entry && !entry.view.webContents.isDestroyed()) {
+    entry.appliedProxyRaw = normalizedProxy;
     entry.hasProxy = res.hasProxy;
+    entry.pendingMainLoadFailed = false;
     entry.hasError = false;
-    entry.view.webContents.setWebRTCIPHandlingPolicy(
-      res.hasProxy ? 'disable_non_proxied_udp' : 'default'
-    );
+    entry.lastErrorCode = null;
+    entry.lastErrorDescription = null;
+    const policy = res.hasProxy ? 'disable_non_proxied_udp' : 'default';
+    entry.view.webContents.setWebRTCIPHandlingPolicy(policy);
+    if (entry.childWindows) {
+      for (const childWin of entry.childWindows) {
+        if (childWin && !childWin.isDestroyed() && !childWin.webContents.isDestroyed()) {
+          childWin.webContents.setWebRTCIPHandlingPolicy(policy);
+        }
+      }
+    }
     layoutViews();
     sendToRenderer('view:did-recover-load', { accountId });
     entry.view.webContents.loadURL(DISCORD_APP_URL).catch(() => {});
@@ -1642,14 +1863,26 @@ ipcMain.handle('views:set-overlay-blocked', async (event, payload) => {
   }
 
   const nextBlocked = Boolean(payload.blocked);
-  const snapshots = {};
+  const mySeq = ++overlayBlockSeq;
 
-  if (nextBlocked && !layoutState.overlayBlocked) {
+  if (!nextBlocked) {
+    layoutState.overlayBlocked = false;
+    layoutViews();
+    return { ok: true, snapshots: {} };
+  }
+
+  const snapshots = {};
+  const shouldCapture = payload.capture !== false && !layoutState.overlayBlocked;
+
+  if (shouldCapture) {
     const visibleIds = layoutState.isSplitView
       ? [layoutState.splitPrimaryId, layoutState.splitSecondaryId].filter(Boolean)
       : [layoutState.activeAccountId].filter(Boolean);
 
     for (const id of visibleIds) {
+      if (mySeq !== overlayBlockSeq) {
+        return { ok: true, stale: true, snapshots: {} };
+      }
       const entry = accountViews.get(id);
       if (entry && entry.view.getVisible() && !entry.hasError && !entry.view.webContents.isDestroyed()) {
         try {
@@ -1662,7 +1895,12 @@ ipcMain.handle('views:set-overlay-blocked', async (event, payload) => {
     }
   }
 
-  layoutState.overlayBlocked = nextBlocked;
+  // Abort if a newer overlay state change arrived while capturePage() was awaiting!
+  if (mySeq !== overlayBlockSeq) {
+    return { ok: true, stale: true, snapshots: {} };
+  }
+
+  layoutState.overlayBlocked = true;
   layoutViews();
   return { ok: true, snapshots };
 });
@@ -1713,18 +1951,14 @@ ipcMain.handle('views:apply-theme', async (event, payload) => {
         'utf8'
       );
     } else {
-      isCustomThemeActive = true;
-      let resolved = customCss;
-      const importMatch = resolved.match(/@import\s+url\(\s*['"]?(https?:\/\/[^'")\s]+)['"]?\s*\)\s*;?/i);
-      if (importMatch && importMatch[1]) {
-        const fetched = await safeFetchThemeCss(importMatch[1], { userAgent: CHROME_USER_AGENT });
-        if (!fetched.success) {
-          return { ok: false, error: fetched.error || 'Failed to load remote theme CSS.' };
-        }
-        const rest = resolved.replace(importMatch[0], '').trim();
-        resolved = `${fetched.css}\n\n${rest}`.trim();
+      const resolvedImports = await resolveThemeCssImports(customCss, {
+        userAgent: CHROME_USER_AGENT
+      });
+      if (!resolvedImports.success) {
+        return { ok: false, error: resolvedImports.error || 'Failed to load remote theme CSS.' };
       }
-      currentResolvedThemeCss = resolved;
+      isCustomThemeActive = true;
+      currentResolvedThemeCss = resolvedImports.css;
     }
 
     await Promise.all(Array.from(accountViews.values()).map((entry) => applyThemeToEntry(entry)));
@@ -1734,25 +1968,30 @@ ipcMain.handle('views:apply-theme', async (event, payload) => {
   }
 });
 
-// Scoped Discord Voice Status Bar Mute / Deafen (Excludes Channel/Server/User Mute buttons!)
+// Scoped Discord Voice Status Bar Mute / Deafen (Excludes Channel/Server/User Mute & supports non-English locales!)
 ipcMain.handle('views:set-mute-all', async (event, payload) => {
   if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return { ok: false };
   const targetMuted = Boolean(payload.muted);
+  globalMutedState = targetMuted;
 
   const script = `
     (() => {
       try {
         const targetMuted = ${targetMuted};
         const candidates = Array.from(document.querySelectorAll('section[aria-label] button[aria-label], [class*="panels_"] button[aria-label]'));
-        const muteBtn = candidates.find((b) => {
+        let muteBtn = candidates.find((b) => {
           const l = (b.getAttribute('aria-label') || '').trim().toLowerCase();
           if (l.includes('channel') || l.includes('server') || l.includes('deafen')) return false;
           return l === 'mute' || l === 'unmute' || l.startsWith('mute ') || l.startsWith('unmute ');
         });
+        if (!muteBtn) {
+          const switches = Array.from(document.querySelectorAll('[class*="panels_"] button[role="switch"][aria-checked]'));
+          if (switches.length >= 2) muteBtn = switches[0];
+        }
         if (muteBtn) {
           const label = (muteBtn.getAttribute('aria-label') || '').toLowerCase();
           const ariaChecked = muteBtn.getAttribute('aria-checked');
-          const isCurrentlyMuted = ariaChecked === 'true' || label.startsWith('unmute');
+          const isCurrentlyMuted = ariaChecked !== null ? ariaChecked === 'true' : label.startsWith('unmute');
           if (targetMuted !== isCurrentlyMuted) {
             muteBtn.click();
           }
@@ -1789,14 +2028,18 @@ ipcMain.handle('views:set-deafen-all', async (event, payload) => {
       try {
         const targetDeafened = ${targetDeafened};
         const candidates = Array.from(document.querySelectorAll('section[aria-label] button[aria-label], [class*="panels_"] button[aria-label]'));
-        const deafenBtn = candidates.find((b) => {
+        let deafenBtn = candidates.find((b) => {
           const l = (b.getAttribute('aria-label') || '').trim().toLowerCase();
           return l === 'deafen' || l === 'undeafen' || l.startsWith('deafen ') || l.startsWith('undeafen ');
         });
+        if (!deafenBtn) {
+          const switches = Array.from(document.querySelectorAll('[class*="panels_"] button[role="switch"][aria-checked]'));
+          if (switches.length >= 2) deafenBtn = switches[1];
+        }
         if (deafenBtn) {
           const label = (deafenBtn.getAttribute('aria-label') || '').toLowerCase();
           const ariaChecked = deafenBtn.getAttribute('aria-checked');
-          const isCurrentlyDeafened = ariaChecked === 'true' || label.startsWith('undeafen');
+          const isCurrentlyDeafened = ariaChecked !== null ? ariaChecked === 'true' : label.startsWith('undeafen');
           if (targetDeafened !== isCurrentlyDeafened) {
             deafenBtn.click();
           }
@@ -1815,6 +2058,13 @@ ipcMain.handle('views:set-deafen-all', async (event, payload) => {
     try {
       if (!isBossKeyMuted) {
         wc.setAudioMuted(targetDeafened);
+        if (entry.childWindows) {
+          for (const childWin of entry.childWindows) {
+            if (childWin && !childWin.isDestroyed() && !childWin.webContents.isDestroyed()) {
+              childWin.webContents.setAudioMuted(targetDeafened);
+            }
+          }
+        }
       }
       const res = await wc.executeJavaScript(script);
       if (!res || !res.clicked) {
@@ -1908,7 +2158,9 @@ ipcMain.on('views:set-zoom', (event, payload) => {
 ipcMain.on('hud:show-tooltip', (event, payload) => {
   if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return;
   if (!payload.visible) {
-    hideHudView();
+    if (hudCurrentKind === 'tooltip') {
+      hideHudView();
+    }
     return;
   }
   const text = escapeHtml(payload.text || '');
@@ -1916,6 +2168,7 @@ ipcMain.on('hud:show-tooltip', (event, payload) => {
   const estimatedWidth = Math.min(340, Math.max(120, (String(payload.text || '').length * 8) + (payload.shortcut ? 72 : 36)));
   const y = Math.max(8, Math.round(Number(payload.y) || 12));
   showHudCard({
+    kind: 'tooltip',
     x: 78,
     y,
     width: estimatedWidth,
@@ -1934,6 +2187,7 @@ ipcMain.on('hud:show-toast', (event, payload) => {
   const width = Math.min(380, Math.max(200, (String(payload.message || '').length * 7.5) + 56));
   const duration = typeof payload.duration === 'number' ? Math.max(800, payload.duration) : 2800;
   showHudCard({
+    kind: 'toast',
     x: Math.max(80, winWidth - width - 24),
     y: Math.max(20, winHeight - 68),
     width,
@@ -1949,6 +2203,7 @@ ipcMain.on('hud:show-zoom', (event, payload) => {
   const [winWidth] = mainWindow.getContentSize();
   const label = escapeHtml(payload.text || 'Zoom: 100%');
   showHudCard({
+    kind: 'zoom',
     x: Math.max(80, winWidth - 156),
     y: Math.max(12, (layoutState.containerRect && layoutState.containerRect.y ? layoutState.containerRect.y : 0) + 14),
     width: 138,
@@ -2300,7 +2555,10 @@ const gotTheLock = IS_TEST_MODE ? true : app.requestSingleInstanceLock();
 if (!gotTheLock) {
   app.quit();
 } else {
-  app.on('second-instance', () => {
+  app.on('second-instance', (_event, commandLine) => {
+    if (Array.isArray(commandLine) && commandLine.includes('--hidden')) {
+      return;
+    }
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (!mainWindow.isVisible()) mainWindow.show();
       if (mainWindow.isMinimized()) mainWindow.restore();

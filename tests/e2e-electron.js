@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
-const { app, globalShortcut, session } = require('electron');
+const { app, BrowserWindow, globalShortcut, session } = require('electron');
 
 app.disableHardwareAcceleration();
 
@@ -225,6 +225,25 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
     await win.webContents.executeJavaScript('closeContextMenu()');
     await waitFor(() => hooks.getLayoutState().overlayBlocked === false && acc1Entry.view.getVisible() === true);
 
+    // Rapid open -> immediate 1ms close race test (while capturePage() is in flight)
+    win.show();
+    await win.webContents.executeJavaScript(`
+      openContextMenu(90, 120, '1');
+      setTimeout(() => closeContextMenu(), 1);
+    `);
+    await new Promise((r) => setTimeout(r, 220));
+    assert.equal(hooks.getLayoutState().overlayBlocked, false, 'Rapid overlay close during capturePage must NOT leave overlayBlocked=true');
+    assert.equal(acc1Entry.view.getVisible(), true, 'Rapid overlay close must leave active Discord WebContentsView visible');
+
+    // HUD tooltip must clear cleanly if sidebar re-renders while an account badge is hovered
+    await win.webContents.executeJavaScript(`
+      const item = document.querySelector('.account-item[data-account-id="1"]');
+      item.dispatchEvent(new MouseEvent('mouseenter'));
+      renderAccountStack();
+    `);
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(hooks.getHudView().getVisible(), false, 'Re-rendering account stack must dismiss hovered HUD tooltip');
+
     // 5. Verify Scoped Global Mute does NOT click "Mute channel"
     console.log('[E2E 5/8] Checking Scoped Global Mute & Theme Engine...');
     await win.webContents.executeJavaScript('document.getElementById("btn-mute-all").click()');
@@ -240,6 +259,10 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
     assert.equal(hooks.isCustomThemeActive(), false);
     await win.webContents.executeJavaScript('applyTheme("midnight")');
     await waitFor(() => hooks.isCustomThemeActive() === true && Boolean(acc1Entry.insertedCssKey));
+    const quotedSsrfTheme = await win.webContents.executeJavaScript(
+      'window.electronAPI.invoke("views:apply-theme", { presetId: "custom", customCss: \'@import "http://127.0.0.1:9999/ssrf.css"; body { color: red; }\' })'
+    );
+    assert.equal(quotedSsrfTheme.ok, false, 'Quoted cleartext/loopback @import must be rejected in views:apply-theme');
     await win.webContents.executeJavaScript('applyTheme("default")');
     await waitFor(() => hooks.isCustomThemeActive() === false && acc1Entry.insertedCssKey === null);
 
@@ -295,6 +318,42 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
       'Proxied account must enforce disable_non_proxied_udp'
     );
 
+    // Verify 4+ consecutive fresh 407 proxy auth challenges (clearAuthCache + reload) all succeed without tripping retry cap
+    const acc2SessionEarly = session.fromPartition(`persist:discord_account_${acc2Id}`);
+    for (let cycle = 1; cycle <= 4; cycle++) {
+      await acc2SessionEarly.clearAuthCache();
+      await acc2SessionEarly.closeAllConnections();
+      acc2Entry.view.webContents.reload();
+      await waitFor(async () => {
+        const bodyTxt = await acc2Entry.view.webContents.executeJavaScript(
+          'document.getElementById("mock-discord") ? document.getElementById("mock-discord").textContent : ""'
+        );
+        return bodyTxt.includes('viaProxy=true');
+      }, `Proxy 407 auth reload cycle #${cycle}`);
+    }
+
+    // Verify Pop-Out child window (about:blank) on proxied account inherits disable_non_proxied_udp & obeys Boss Key!
+    const winsBeforePopout = BrowserWindow.getAllWindows().length;
+    await acc2Entry.view.webContents.executeJavaScript(
+      'window.__pop = window.open("about:blank", "discord_call_popout", "width=420,height=320"); true;'
+    );
+    await waitFor(() => BrowserWindow.getAllWindows().length > winsBeforePopout, 'Pop-out child window opened');
+    const popoutWin = BrowserWindow.getAllWindows().find((w) => w !== win);
+    assert.ok(popoutWin, 'Expected Pop-Out BrowserWindow');
+    assert.equal(
+      popoutWin.webContents.getWebRTCIPHandlingPolicy(),
+      'disable_non_proxied_udp',
+      'Pop-Out call window on proxied account MUST enforce disable_non_proxied_udp'
+    );
+    win.show();
+    hooks.handleBossKey();
+    assert.equal(popoutWin.isVisible(), false, 'Boss Key must also hide open Pop-Out call windows');
+    assert.equal(popoutWin.webContents.isAudioMuted(), true, 'Boss Key must also mute open Pop-Out call windows');
+    hooks.toggleWindow();
+    assert.equal(popoutWin.isVisible(), true, 'Restoring from Tray must restore Pop-Out call windows');
+    assert.equal(popoutWin.webContents.isAudioMuted(), false, 'Restoring from Tray must unmute Pop-Out call windows');
+    popoutWin.destroy();
+
     // Wait briefly for async logger flush and verify plaintext password was redacted
     await new Promise((r) => setTimeout(r, 150));
     const logContents = fs.existsSync(hooks.getLogFilePath())
@@ -327,6 +386,15 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
       );
       return hasErrDom && acc2Entry.hasError === true && acc2Entry.view.getVisible() === false;
     }, 'Unreachable proxy triggers visible HTML error overlay with native view hidden');
+
+    // Verify App Shell Reload (Ctrl+Shift+R / win.reload()) re-renders error card instead of a dead blank screen!
+    win.reload();
+    await waitFor(async () => {
+      const hasErrAfterReload = await win.webContents.executeJavaScript(
+        `typeof erroredAccounts !== "undefined" && Boolean(document.getElementById("error-overlay-" + ${JSON.stringify(acc2Id)}))`
+      );
+      return hasErrAfterReload && acc2Entry.view.getVisible() === false;
+    }, 'App shell reload must preserve error overlay on errored account');
 
     // Restore valid proxy before Split View test
     await win.webContents.executeJavaScript(
@@ -387,10 +455,17 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
     assert.equal(hooks.isBossKeyMuted(), false, 'System Tray restore must clear Boss Key mute state');
     assert.equal(acc1Entry.view.webContents.isAudioMuted(), false, 'Account audio must be restored after Tray show');
 
-    // Second cycle to prove no permanent mute lock!
+    // Second cycle + Deafen All -> Boss Key -> Undeafen while hidden -> Tray restore independence check!
+    await win.webContents.executeJavaScript('window.electronAPI.invoke("views:set-deafen-all", { deafened: true })');
+    assert.equal(acc1Entry.view.webContents.isAudioMuted(), true);
     hooks.handleBossKey();
+    await win.webContents.executeJavaScript('window.electronAPI.invoke("views:set-deafen-all", { deafened: false })');
     hooks.toggleWindow();
-    assert.equal(acc1Entry.view.webContents.isAudioMuted(), false);
+    assert.equal(
+      acc1Entry.view.webContents.isAudioMuted(),
+      false,
+      'Undeafening while hidden under Boss Key must NOT leave accounts muted after restore'
+    );
 
     // Verify Screen-Share Custom Audio Patch inside Account 1's WebContentsView:
     // (a) withAudio = false -> does NOT call getUserMedia even when custom device is selected

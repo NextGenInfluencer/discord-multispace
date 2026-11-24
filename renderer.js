@@ -177,38 +177,37 @@ function showToast(message, optionsOrIsError = false) {
     }
   }
 
-  // Render in HTML overlay container (visible when modals/menus/error overlays are active)
-  const container = document.getElementById('toast-container');
-  if (container) {
-    const toast = document.createElement('div');
-    toast.className = 'app-toast';
+  // Render in HTML overlay container when modals/menus block HUD; otherwise render in native HUD pill so toasts never double-overlap
+  if (isAnyOverlayOpen()) {
+    const container = document.getElementById('toast-container');
+    if (container) {
+      const toast = document.createElement('div');
+      toast.className = 'app-toast';
 
-    const icon = document.createElement('span');
-    icon.className = 'toast-icon';
-    if (isError) {
-      icon.style.color = 'var(--accent-red)';
-      icon.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>';
-    } else {
-      icon.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+      const icon = document.createElement('span');
+      icon.className = 'toast-icon';
+      if (isError) {
+        icon.style.color = 'var(--accent-red)';
+        icon.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>';
+      } else {
+        icon.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+      }
+
+      const text = document.createElement('span');
+      text.className = 'toast-message';
+      text.textContent = message;
+
+      toast.appendChild(icon);
+      toast.appendChild(text);
+      container.appendChild(toast);
+
+      requestAnimationFrame(() => toast.classList.add('visible'));
+      setTimeout(() => {
+        toast.classList.remove('visible');
+        setTimeout(() => toast.remove(), 250);
+      }, duration);
     }
-
-    const text = document.createElement('span');
-    text.className = 'toast-message';
-    text.textContent = message;
-
-    toast.appendChild(icon);
-    toast.appendChild(text);
-    container.appendChild(toast);
-
-    requestAnimationFrame(() => toast.classList.add('visible'));
-    setTimeout(() => {
-      toast.classList.remove('visible');
-      setTimeout(() => toast.remove(), 250);
-    }, duration);
-  }
-
-  // Also display in top-most native HUD WebContentsView when Discord views are visible
-  if (!isAnyOverlayOpen()) {
+  } else {
     eAPI.send('hud:show-toast', { message, isError, duration });
   }
 }
@@ -216,16 +215,17 @@ function showToast(message, optionsOrIsError = false) {
 let zoomToastTimer = null;
 function showZoomIndicator(factor) {
   const text = `Zoom: ${Math.round(factor * 100)}%`;
-  const zoomIndicator = document.getElementById('zoom-indicator');
-  if (zoomIndicator) {
-    zoomIndicator.textContent = text;
-    zoomIndicator.classList.add('visible');
-    clearTimeout(zoomToastTimer);
-    zoomToastTimer = setTimeout(() => {
-      zoomIndicator.classList.remove('visible');
-    }, 1400);
-  }
-  if (!isAnyOverlayOpen()) {
+  if (isAnyOverlayOpen()) {
+    const zoomIndicator = document.getElementById('zoom-indicator');
+    if (zoomIndicator) {
+      zoomIndicator.textContent = text;
+      zoomIndicator.classList.add('visible');
+      clearTimeout(zoomToastTimer);
+      zoomToastTimer = setTimeout(() => {
+        zoomIndicator.classList.remove('visible');
+      }, 1400);
+    }
+  } else {
     eAPI.send('hud:show-zoom', { text });
   }
 }
@@ -311,30 +311,45 @@ function renderSnapshots(snapshots) {
   }
 }
 
+let overlaySyncSeq = 0;
+let overlayInFlightCount = 0;
+
 async function syncOverlayBlockState() {
   const blocked = isAnyOverlayOpen();
-  if (blocked === lastOverlayBlocked) return;
-  lastOverlayBlocked = blocked;
+  if (blocked === lastOverlayBlocked && overlayInFlightCount === 0) return;
 
-  if (blocked) {
-    eAPI.send('hud:show-tooltip', { visible: false });
-    try {
-      const res = await eAPI.invoke('views:set-overlay-blocked', { blocked: true });
-      if (isAnyOverlayOpen() && res && res.snapshots) {
+  const wasAlreadyBlocked = lastOverlayBlocked;
+  lastOverlayBlocked = blocked;
+  const seq = ++overlaySyncSeq;
+  overlayInFlightCount += 1;
+
+  try {
+    if (blocked) {
+      eAPI.send('hud:show-tooltip', { visible: false });
+      const res = await eAPI.invoke('views:set-overlay-blocked', {
+        blocked: true,
+        capture: !wasAlreadyBlocked,
+        seq
+      });
+      if (seq === overlaySyncSeq && isAnyOverlayOpen() && res && !res.stale && res.snapshots) {
         renderSnapshots(res.snapshots);
       }
-    } catch {}
-  } else {
-    clearSnapshots();
-    try {
-      await eAPI.invoke('views:set-overlay-blocked', { blocked: false });
-    } catch {}
+    } else {
+      clearSnapshots();
+      await eAPI.invoke('views:set-overlay-blocked', { blocked: false, seq });
+    }
+  } catch {} finally {
+    overlayInFlightCount = Math.max(0, overlayInFlightCount - 1);
   }
 }
 
 function updateSplitDividerVisibility() {
   if (paneSplitDivider) {
     paneSplitDivider.classList.toggle('hidden', !isSplitView);
+    if (isSplitView) {
+      const rect = getContainerRect();
+      paneSplitDivider.style.left = `${Math.max(0, Math.floor((rect.width - 2) / 2))}px`;
+    }
   }
 }
 
@@ -358,6 +373,7 @@ if (webviewContainer && typeof ResizeObserver === 'function') {
   ro.observe(webviewContainer);
 }
 window.addEventListener('resize', () => pushLayoutToMain(false));
+window.addEventListener('blur', () => eAPI.send('hud:show-tooltip', { visible: false }));
 
 function serializeAccountsWithZoom() {
   return accounts.map((acc) => ({
@@ -369,7 +385,7 @@ function serializeAccountsWithZoom() {
 }
 
 async function syncAccountsWithMain() {
-  return eAPI.invoke('views:sync-accounts', {
+  const res = await eAPI.invoke('views:sync-accounts', {
     accounts: serializeAccountsWithZoom(),
     activeAccountId,
     isSplitView,
@@ -378,6 +394,41 @@ async function syncAccountsWithMain() {
     containerRect: getContainerRect(),
     overlayBlocked: isAnyOverlayOpen()
   });
+
+  if (res && res.ok) {
+    if (res.audioState && typeof res.audioState === 'object') {
+      isMutedAll = Boolean(res.audioState.isMutedAll);
+      isDeafenedAll = Boolean(res.audioState.isDeafenedAll);
+      if (btnMuteAll) btnMuteAll.classList.toggle('active-muted', isMutedAll);
+      if (btnDeafenAll) btnDeafenAll.classList.toggle('active-deafened', isDeafenedAll);
+    }
+
+    if (res.viewStates && typeof res.viewStates === 'object') {
+      for (const [id, st] of Object.entries(res.viewStates)) {
+        if (!st || typeof st !== 'object') continue;
+        if (st.isLoading) loadingAccounts.add(id);
+        else loadingAccounts.delete(id);
+
+        if (st.isHibernated) accountHibernating[id] = true;
+        else delete accountHibernating[id];
+
+        if (st.badge !== undefined) {
+          updateNotificationBadge(id, st.badge);
+        }
+
+        if (st.hasError) {
+          erroredAccounts.add(id);
+          showWebviewError(id, st.errorDescription, st.errorCode);
+        } else if (erroredAccounts.has(id)) {
+          erroredAccounts.delete(id);
+          clearWebviewError(id);
+        }
+      }
+      refreshLoadingBar();
+    }
+  }
+
+  return res;
 }
 
 // ==========================================================================
@@ -747,6 +798,7 @@ function getInitials(name) {
 }
 
 function renderAccountStack() {
+  eAPI.send('hud:show-tooltip', { visible: false });
   accountStack.innerHTML = '';
 
   accounts.forEach((acc, index) => {
@@ -2181,6 +2233,10 @@ async function bootApplication() {
   eAPI.send('set-stream-audio-device', currentStreamAudioDevice);
   populateStreamAudioDevices();
 
+  // Render sidebar stack immediately so UI never blocks on slow/offline remote theme fetches
+  renderAccountStack();
+  updateThemeUI();
+
   // Sync main-process startup & global shortcut preferences
   try {
     const settings = await eAPI.invoke('get-startup-setting');
@@ -2192,7 +2248,6 @@ async function bootApplication() {
   // Pre-load saved theme into main process BEFORE Discord views navigate (fixes boot theme pre-fetch)
   await applyTheme(currentThemeId, currentThemeCss, true);
 
-  renderAccountStack();
   await syncAccountsWithMain();
   sendTrayStatus();
 }

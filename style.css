@@ -111,8 +111,9 @@ html, body {
   align-items: center;
   width: 100%;
   flex: 1;
-  overflow-y: overlay;
+  overflow-y: auto;
   overflow-x: hidden;
+  scrollbar-width: none;
   gap: 8px;
   padding-bottom: 8px;
 }
@@ -362,52 +363,9 @@ html, body {
    Tooltips
    ========================================================================== */
 
+/* Rendered natively via topmost hudView so tooltips are never clipped by WebContentsView or duplicated over error cards */
 .badge-tooltip {
-  position: absolute;
-  left: 82px;
-  background-color: var(--bg-floating);
-  color: var(--text-header);
-  padding: 8px 12px;
-  border-radius: 6px;
-  font-size: 13px;
-  font-weight: 600;
-  white-space: nowrap;
-  pointer-events: none;
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45);
-  opacity: 0;
-  transform: scale(0.92) translateX(-4px);
-  transition: opacity 0.15s ease, transform 0.15s var(--ease-spring);
-  z-index: 1000;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.tooltip-shortcut {
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--text-muted);
-  background: rgba(255, 255, 255, 0.08);
-  padding: 1px 5px;
-  border-radius: 4px;
-  text-transform: uppercase;
-  letter-spacing: 0.02em;
-}
-
-.badge-tooltip::before {
-  content: '';
-  position: absolute;
-  left: -5px;
-  top: 50%;
-  transform: translateY(-50%);
-  border-top: 5px solid transparent;
-  border-bottom: 5px solid transparent;
-  border-right: 5px solid var(--bg-floating);
-}
-
-.account-item:hover .badge-tooltip {
-  opacity: 1;
-  transform: scale(1) translateX(0);
+  display: none !important;
 }
 
 /* ==========================================================================

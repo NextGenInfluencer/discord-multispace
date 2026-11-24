@@ -15,6 +15,7 @@ const {
   isPrivateOrReservedIP,
   validateHttpsPublicUrl,
   safeFetchThemeCss,
+  resolveThemeCssImports,
   transformDiscordCspHeader,
   isTrustedDiscordOrigin,
   classifyNavigationUrl,
@@ -147,7 +148,15 @@ test('SSRF IPv4 and IPv6 private, loopback, metadata, and NAT64/mapped blocking'
     '::ffff:10.0.0.1',
     '::ffff:169.254.169.254',
     '::ffff:192.168.1.1',
+    '::ffff:0:127.0.0.1',
     '64:ff9b::127.0.0.1',
+    '64:ff9b:1::1',
+    '64:ff9b:1:7f00:1::0808:0808',
+    '100::1',
+    'fec0::1',
+    '2001:2::1',
+    '2001:10::1',
+    '2001:0000:4136:e378:8000:63bf:80ff:fffe',
     '2002:7f00:0001::1'
   ];
 
@@ -163,6 +172,7 @@ test('SSRF IPv4 and IPv6 private, loopback, metadata, and NAT64/mapped blocking'
     '100.63.255.255',
     '100.128.0.1',
     '::ffff:8.8.8.8',
+    '2001:0000:4136:e378:8000:63bf:f7f7:f7f7',
     '2606:4700:4700::1111',
     '2001:4860:4860::8888'
   ];
@@ -172,7 +182,7 @@ test('SSRF IPv4 and IPv6 private, loopback, metadata, and NAT64/mapped blocking'
   }
 });
 
-test('safeFetchThemeCss enforces HTTPS, blocks SSRF redirects, caps size at 1MB, and resolves safe @imports', async () => {
+test('safeFetchThemeCss & resolveThemeCssImports enforce HTTPS, DNS-pinning, multi-@import SSRF blocking, and 1MB cap', async () => {
   const publicLookup = async () => [{ address: '93.184.216.34', family: 4 }];
   const privateLookup = async () => [{ address: '127.0.0.1', family: 4 }];
 
@@ -188,6 +198,34 @@ test('safeFetchThemeCss enforces HTTPS, blocks SSRF redirects, caps size at 1MB,
   const dnsRebindRes = await safeFetchThemeCss('https://theme.example.com/a.css', { lookupFn: privateLookup });
   assert.equal(dnsRebindRes.success, false);
   assert.match(dnsRebindRes.error, /private|loopback/i);
+
+  // 2b. DNS Rebinding TOCTOU Defense: real fetchHttpsPinned path calls lookupFn ONLY ONCE per hop (pins validated IP!)
+  let rebindLookupCalls = 0;
+  const rebindAttemptLookup = async () => {
+    rebindLookupCalls += 1;
+    // First call returns unreachable TEST-NET/public IP (or fast-refused); second call would return 127.0.0.1 if unpinned!
+    if (rebindLookupCalls === 1) return [{ address: '127.0.0.1', family: 4 }];
+    return [{ address: '127.0.0.1', family: 4 }];
+  };
+  const pinnedCheck = await safeFetchThemeCss('https://rebind.example.com/evil.css', {
+    lookupFn: rebindAttemptLookup,
+    timeoutMs: 250
+  });
+  assert.equal(pinnedCheck.success, false);
+  assert.equal(rebindLookupCalls, 1, 'lookupFn must be invoked once and blocked before socket connect');
+
+  // Also test when 1st lookup returns a public IP while no fetchFn is supplied: lookupFn is STILL called only once (never re-queried!)
+  let singleLookupCount = 0;
+  await safeFetchThemeCss('https://rebind2.example.com:65534/evil.css', {
+    lookupFn: async () => {
+      singleLookupCount += 1;
+      return singleLookupCount === 1
+        ? [{ address: '1.1.1.1', family: 4 }]
+        : [{ address: '127.0.0.1', family: 4 }];
+    },
+    timeoutMs: 150
+  });
+  assert.equal(singleLookupCount, 1, 'Production HTTPS fetcher must pin the first validated DNS result without a 2nd lookup');
 
   // 3. 302 Redirect to loopback IP blocked!
   const redirectRes = await safeFetchThemeCss('https://theme.example.com/start.css', {
@@ -242,22 +280,64 @@ test('safeFetchThemeCss enforces HTTPS, blocks SSRF redirects, caps size at 1MB,
   assert.equal(validRes.success, true);
   assert.match(validRes.css, /\.sub \{ color: #fff; \}/);
   assert.match(validRes.css, /\.main \{ background: #000; \}/);
+
+  // 6. resolveThemeCssImports blocks quoted @import "http://..." & unquoted url(...) SSRF, and resolves multiple safe @imports!
+  const quotedHttpImport = await resolveThemeCssImports('@import "http://127.0.0.1:9999/ssrf.css"; body { color: #fff; }', {
+    lookupFn: publicLookup
+  });
+  assert.equal(quotedHttpImport.success, false);
+  assert.match(quotedHttpImport.error, /HTTPS/i);
+
+  const secondImportSsrf = await resolveThemeCssImports(
+    '@import url("https://theme.example.com/one.css");\n@import "https://127.0.0.1/two.css";',
+    {
+      lookupFn: publicLookup,
+      fetchFn: async () => ({
+        status: 200,
+        ok: true,
+        headers: new Map(),
+        text: async () => '.one { color: #111; }'
+      })
+    }
+  );
+  assert.equal(secondImportSsrf.success, false);
+  assert.match(secondImportSsrf.error, /private|loopback/i);
+
+  const multiValid = await resolveThemeCssImports(
+    '@import "https://theme.example.com/a.css";\n@import url("https://theme.example.com/b.css");\n:root { --ok: 1; }',
+    {
+      lookupFn: publicLookup,
+      fetchFn: async (url) => ({
+        status: 200,
+        ok: true,
+        headers: new Map(),
+        text: async () => (url.endsWith('/a.css') ? '.a{color:red}' : '.b{color:blue}')
+      })
+    }
+  );
+  assert.equal(multiValid.success, true);
+  assert.match(multiValid.css, /\.a\{color:red\}/);
+  assert.match(multiValid.css, /\.b\{color:blue\}/);
+  assert.match(multiValid.css, /--ok: 1/);
+  assert.equal(/@import/i.test(multiValid.css), false);
 });
 
 test('Discord CSP header preservation — connect-src and script-src are NEVER weakened', () => {
   const sampleDiscordCsp =
-    "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' https://cdn.discordapp.com; font-src 'self'; connect-src 'self' https://discord.com wss://gateway.discord.gg";
+    "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; style-src-elem 'self' 'nonce-abc123'; img-src 'self' https://cdn.discordapp.com; font-src 'self'; connect-src 'self' https://discord.com wss://gateway.discord.gg";
 
   // Default / Minimalist: 100% untouched byte-for-byte
   assert.equal(transformDiscordCspHeader(sampleDiscordCsp, false), sampleDiscordCsp);
 
-  // Active custom theme: connect-src and script-src remain untouched, no wildcard '*'
+  // Active custom theme: connect-src and script-src remain untouched, no wildcard '*', nonce directive not broken by 'unsafe-inline'
   const relaxed = transformDiscordCspHeader(sampleDiscordCsp, true);
   assert.match(relaxed, /connect-src 'self' https:\/\/discord\.com wss:\/\/gateway\.discord\.gg/);
   assert.match(relaxed, /script-src 'self' 'unsafe-inline'/);
   assert.equal(relaxed.includes('connect-src *'), false);
   assert.equal(relaxed.includes('style-src *'), false);
   assert.match(relaxed, /style-src 'self' 'unsafe-inline' https: data: blob:/);
+  assert.match(relaxed, /style-src-elem 'self' 'nonce-abc123' https: data: blob:/);
+  assert.equal(/style-src-elem[^;]*'unsafe-inline'/.test(relaxed), false);
 });
 
 test('Origin, navigation, redirect, and popup classification guards', () => {
@@ -350,4 +430,6 @@ test('Repository PII, bundled offline assets, CSP, and packaging hygiene checks'
 
   assert.ok(fs.statSync(path.join(ROOT_DIR, 'assets', 'icon.ico')).size > 20000);
   assert.ok(fs.statSync(path.join(ROOT_DIR, 'tray-icon.png')).size > 1000);
+  assert.ok(fs.statSync(path.join(ROOT_DIR, 'assets', 'fonts', 'Inter-Variable.woff2')).size > 40000);
+  assert.equal(fs.existsSync(path.join(ROOT_DIR, 'assets', 'fonts', 'Inter-Regular.woff2')), false);
 });
