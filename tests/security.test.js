@@ -485,4 +485,14 @@ test('Window bounds & maximized state persistence clamping across multi-monitor 
     sanitizeWindowState({ x: 0, y: 0, width: 1280, height: 800, isMaximized: false }, singleDisplay, defaults),
     { x: 0, y: 0, width: 1280, height: 800, isMaximized: false }
   );
+
+  // 8. When displays[0] is a secondary monitor and displays[1] is primary, off-screen windows re-center onto primary
+  const reorderedDisplays = [
+    { id: 2, isPrimary: false, bounds: { x: -1920, y: 0, width: 1920, height: 1080 }, workArea: { x: -1920, y: 0, width: 1920, height: 1040 } },
+    { id: 1, isPrimary: true, bounds: { x: 0, y: 0, width: 1920, height: 1080 }, workArea: { x: 0, y: 0, width: 1920, height: 1040 } }
+  ];
+  assert.deepEqual(
+    sanitizeWindowState({ x: 4200, y: 100, width: 1280, height: 800, isMaximized: true }, reorderedDisplays, defaults),
+    { x: 320, y: 120, width: 1280, height: 800, isMaximized: true }
+  );
 });

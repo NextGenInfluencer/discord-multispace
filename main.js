@@ -70,6 +70,7 @@ let mainSettings = {
 };
 let windowStateSaveTimer = null;
 let pendingMaximizeOnFirstShow = false;
+let lastNormalWindowMaximized = false;
 let settingsWriteQueue = Promise.resolve();
 
 // Account WebContentsViews: accountId -> entry
@@ -103,12 +104,16 @@ let globalDeafenedState = false;
 
 // Screen share state
 const pendingDisplayMediaRequests = new Map();
+const accountDisplayMediaEpoch = new Map();
+let displayMediaRequestSeq = 0;
 let lastConfirmedDisplayMedia = null;
 let lastConfirmedTimestamp = 0;
 let lastShareAudioPreference = true;
 
 // Updater state
 let lastUpdateCheckManual = false;
+let isUpdateCheckInFlight = false;
+let errorEmittedDuringCheck = false;
 let isExplicitDownloadInFlight = false;
 let errorEmittedDuringDownload = false;
 let updateDownloadedReady = false;
@@ -190,6 +195,7 @@ function loadMainSettings() {
             isMaximized: Boolean(ws.isMaximized)
           }
         };
+        lastNormalWindowMaximized = Boolean(mainSettings.windowState.isMaximized);
       }
     }
   } catch (err) {
@@ -219,9 +225,17 @@ function saveMainSettingsSync() {
 
 function captureCurrentWindowState() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  const isMax = mainWindow.isMaximized() || pendingMaximizeOnFirstShow;
   const isMin = mainWindow.isMinimized();
   const isFull = mainWindow.isFullScreen();
+  // On Windows, Win32 IsZoomed(hwnd) returns FALSE while IsIconic(hwnd) is TRUE (minimized),
+  // so preserve the pre-minimize/pre-fullscreen maximized state whenever minimized or fullscreen.
+  let isMax;
+  if (isMin || isFull) {
+    isMax = Boolean(lastNormalWindowMaximized || pendingMaximizeOnFirstShow);
+  } else {
+    isMax = Boolean(mainWindow.isMaximized() || pendingMaximizeOnFirstShow);
+    lastNormalWindowMaximized = isMax;
+  }
 
   let nextBounds = mainSettings.windowState || { width: 1280, height: 800 };
   if (!isMax && !isMin && !isFull) {
@@ -234,7 +248,7 @@ function captureCurrentWindowState() {
         height: Math.round(b.height)
       };
     }
-  } else if (typeof mainWindow.getNormalBounds === 'function' && (!nextBounds || !Number.isFinite(nextBounds.x))) {
+  } else if (typeof mainWindow.getNormalBounds === 'function') {
     try {
       const nb = mainWindow.getNormalBounds();
       if (nb && nb.width >= 200 && nb.height >= 200 && nb.x > -20000 && nb.y > -20000) {
@@ -355,6 +369,7 @@ function cancelPendingDisplayMediaRequests(predicate, reason = 'cancelled') {
 
 function cancelPendingDisplayMediaForAccount(accountId, reason = 'account-changed') {
   if (!isValidAccountId(accountId)) return 0;
+  accountDisplayMediaEpoch.set(accountId, (accountDisplayMediaEpoch.get(accountId) || 0) + 1);
   const entry = accountViews.get(accountId);
   let targetSes = null;
   try {
@@ -387,8 +402,10 @@ function cancelPendingDisplayMediaForAccount(accountId, reason = 'account-change
 
 async function handleDisplayMediaRequest(request, callback, targetSession = null) {
   try {
+    const reqSeq = ++displayMediaRequestSeq;
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const { ownerWc, ownerAccountId } = resolveDisplayMediaOwner(request, targetSession);
+    const startAccountEpoch = ownerAccountId ? (accountDisplayMediaEpoch.get(ownerAccountId) || 0) : 0;
     log(`Handling display media request [${requestId}] from origin: ${(request && request.securityOrigin) || 'unknown'} (account: ${ownerAccountId || 'unknown'})`);
 
     let abortedDuringCapture = false;
@@ -424,9 +441,17 @@ async function handleDisplayMediaRequest(request, callback, targetSession = null
     if (
       abortedDuringCapture ||
       (ownerWc && ownerWc.isDestroyed()) ||
-      (ownerAccountId && !accountViews.has(ownerAccountId))
+      (ownerAccountId && !accountViews.has(ownerAccountId)) ||
+      (ownerAccountId && (accountDisplayMediaEpoch.get(ownerAccountId) || 0) !== startAccountEpoch)
     ) {
       log(`Aborting display media request [${requestId}] — requesting view reloaded or closed during source enumeration`);
+      callback({});
+      return;
+    }
+
+    // If a newer getDisplayMedia request arrived while getSources() was awaiting, never let this older request clobber it
+    if (reqSeq !== displayMediaRequestSeq) {
+      log(`Aborting superseded display media request [${requestId}] — newer request is active`);
       callback({});
       return;
     }
@@ -447,6 +472,7 @@ async function handleDisplayMediaRequest(request, callback, targetSession = null
     if (lastConfirmedDisplayMedia && sameConfirmedSession && (now - lastConfirmedTimestamp) < 2000) {
       const matchingSource = sources.find((s) => s.id === lastConfirmedDisplayMedia.sourceId);
       if (matchingSource) {
+        await syncScreenShareAudioStateToViews(lastConfirmedDisplayMedia.withAudio, ownerAccountId, ownerWc);
         log(`Auto-fulfilling secondary display media request [${requestId}] with confirmed source [${matchingSource.id}]`);
         callback({
           video: matchingSource,
@@ -474,7 +500,8 @@ async function handleDisplayMediaRequest(request, callback, targetSession = null
       request,
       ownerWc,
       ownerAccountId,
-      targetSession
+      targetSession,
+      accountEpoch: startAccountEpoch
     });
 
     const serializedSources = sources
@@ -692,113 +719,119 @@ app.on('web-contents-created', (_event, contents) => {
 const DISCORD_MEDIA_AUDIO_PATCH = `
 (() => {
   try {
-    if (window.__discordMultiSpaceAudioPatched) return;
-    window.__discordMultiSpaceAudioPatched = true;
     if (typeof window.__discordMultiSpaceShareAudio !== 'boolean') {
       window.__discordMultiSpaceShareAudio = true;
     }
 
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+      return;
+    }
+    if (navigator.mediaDevices.getDisplayMedia.__discordMultiSpacePatched) {
+      window.__discordMultiSpaceAudioPatched = true;
+      return;
+    }
+
     const matchAudioInputDevice = ${matchAudioInputDevice.toString()};
+    const originalGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
+    const patchedGetDisplayMedia = async function(constraints) {
+      const safe = (typeof constraints === 'object' && constraints !== null)
+        ? Object.assign({}, constraints)
+        : { video: true };
 
-    if (navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function') {
-      const originalGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
-      navigator.mediaDevices.getDisplayMedia = async function(constraints) {
-        const safe = (typeof constraints === 'object' && constraints !== null)
-          ? Object.assign({}, constraints)
-          : { video: true };
+      if (!safe.audio || typeof safe.audio !== 'object') {
+        safe.audio = {
+          autoGainControl: false,
+          echoCancellation: false,
+          noiseSuppression: false,
+          systemAudio: 'include'
+        };
+      } else {
+        safe.audio = Object.assign({}, safe.audio, {
+          autoGainControl: false,
+          echoCancellation: false,
+          noiseSuppression: false,
+          systemAudio: 'include'
+        });
+      }
 
-        if (!safe.audio || typeof safe.audio !== 'object') {
-          safe.audio = {
-            autoGainControl: false,
-            echoCancellation: false,
-            noiseSuppression: false,
-            systemAudio: 'include'
-          };
-        } else {
-          safe.audio = Object.assign({}, safe.audio, {
-            autoGainControl: false,
-            echoCancellation: false,
-            noiseSuppression: false,
-            systemAudio: 'include'
-          });
-        }
+      const stream = await originalGetDisplayMedia(safe);
 
-        const stream = await originalGetDisplayMedia(safe);
-
-        // Respect unchecked "Share Audio" — never capture custom mic/cable if user unchecked audio!
-        if (window.__discordMultiSpaceShareAudio === false) {
-          stream.getAudioTracks().forEach((t) => {
-            try {
-              stream.removeTrack(t);
-              t.stop();
-            } catch {}
-          });
-          return stream;
-        }
-
-        const targetLabel = (window.__discordMultiSpaceAudioDeviceLabel || 'loopback').trim();
-        if (targetLabel && targetLabel !== 'loopback' && navigator.mediaDevices.getUserMedia) {
+      // Respect unchecked "Share Audio" — never capture custom mic/cable if user unchecked audio!
+      if (window.__discordMultiSpaceShareAudio === false) {
+        stream.getAudioTracks().forEach((t) => {
           try {
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const matched = matchAudioInputDevice(devices, targetLabel);
+            stream.removeTrack(t);
+            t.stop();
+          } catch {}
+        });
+        return stream;
+      }
 
-            if (matched && matched.deviceId) {
-              const customStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                  deviceId: { exact: matched.deviceId },
-                  autoGainControl: false,
-                  echoCancellation: false,
-                  noiseSuppression: false,
-                  channelCount: 2
-                }
+      const targetLabel = (window.__discordMultiSpaceAudioDeviceLabel || 'loopback').trim();
+      if (targetLabel && targetLabel !== 'loopback' && navigator.mediaDevices.getUserMedia) {
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const matched = matchAudioInputDevice(devices, targetLabel);
+
+          if (matched && matched.deviceId) {
+            const customStream = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                deviceId: { exact: matched.deviceId },
+                autoGainControl: false,
+                echoCancellation: false,
+                noiseSuppression: false,
+                channelCount: 2
+              }
+            });
+            const customTrack = customStream.getAudioTracks()[0];
+            if (customTrack) {
+              customTrack.enabled = true;
+              if ('contentHint' in customTrack) {
+                try { customTrack.contentHint = 'music'; } catch {}
+              }
+              stream.getAudioTracks().forEach((t) => {
+                try {
+                  stream.removeTrack(t);
+                  t.stop();
+                } catch {}
               });
-              const customTrack = customStream.getAudioTracks()[0];
-              if (customTrack) {
-                customTrack.enabled = true;
-                if ('contentHint' in customTrack) {
-                  try { customTrack.contentHint = 'music'; } catch {}
-                }
-                stream.getAudioTracks().forEach((t) => {
-                  try {
-                    stream.removeTrack(t);
-                    t.stop();
-                  } catch {}
-                });
-                stream.addTrack(customTrack);
+              stream.addTrack(customTrack);
 
-                // Stop custom audio capture handle when video stream ends OR when Discord stops video track
-                let cleanedUp = false;
-                const stopCustomAudio = () => {
-                  if (cleanedUp) return;
-                  cleanedUp = true;
-                  try { customTrack.stop(); } catch {}
+              // Stop custom audio capture handle when video stream ends OR when Discord stops video track
+              let cleanedUp = false;
+              const stopCustomAudio = () => {
+                if (cleanedUp) return;
+                cleanedUp = true;
+                try { customTrack.stop(); } catch {}
+              };
+              const videoTrack = stream.getVideoTracks()[0];
+              if (videoTrack) {
+                videoTrack.addEventListener('ended', stopCustomAudio, { once: true });
+                const origStop = videoTrack.stop.bind(videoTrack);
+                videoTrack.stop = function(...args) {
+                  stopCustomAudio();
+                  return origStop(...args);
                 };
-                const videoTrack = stream.getVideoTracks()[0];
-                if (videoTrack) {
-                  videoTrack.addEventListener('ended', stopCustomAudio, { once: true });
-                  const origStop = videoTrack.stop.bind(videoTrack);
-                  videoTrack.stop = function(...args) {
-                    stopCustomAudio();
-                    return origStop(...args);
-                  };
-                }
               }
             }
-          } catch (err) {
-            console.warn('[MultiSpace] Custom audio track injection failed, retaining default loopback:', err);
           }
-        } else {
-          stream.getAudioTracks().forEach((track) => {
-            track.enabled = true;
-            if ('contentHint' in track) {
-              try { track.contentHint = 'music'; } catch {}
-            }
-          });
+        } catch (err) {
+          console.warn('[MultiSpace] Custom audio track injection failed, retaining default loopback:', err);
         }
+      } else {
+        stream.getAudioTracks().forEach((track) => {
+          track.enabled = true;
+          if ('contentHint' in track) {
+            try { track.contentHint = 'music'; } catch {}
+          }
+        });
+      }
 
-        return stream;
-      };
-    }
+      return stream;
+    };
+    patchedGetDisplayMedia.__discordMultiSpacePatched = true;
+    navigator.mediaDevices.getDisplayMedia = patchedGetDisplayMedia;
+    window.__discordMultiSpaceAudioPatched = true;
   } catch {}
 })();
 `;
@@ -822,24 +855,62 @@ function broadcastAudioDeviceLabelToViews(label) {
   }
 }
 
-async function syncScreenShareAudioStateToViews(allowAudio) {
-  lastShareAudioPreference = Boolean(allowAudio);
-  const script = `window.__discordMultiSpaceShareAudio = ${lastShareAudioPreference}; window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`;
-  const tasks = [];
-  for (const entry of accountViews.values()) {
-    const wc = entry.view.webContents;
-    if (wc && !wc.isDestroyed()) {
-      tasks.push(wc.executeJavaScript(script).catch(() => {}));
+function executeJsWithTimeout(wc, script, timeoutMs = 400) {
+  if (!wc || wc.isDestroyed()) return Promise.resolve();
+  let timer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  return Promise.race([
+    wc.executeJavaScript(script).catch(() => {}),
+    timeoutPromise
+  ]).finally(() => {
+    clearTimeout(timer);
+  });
+}
+
+async function syncScreenShareAudioStateToViews(allowAudio, targetAccountId = null, targetWc = null) {
+  const normalizedAllow = Boolean(allowAudio);
+  lastShareAudioPreference = normalizedAllow;
+  const script = `window.__discordMultiSpaceShareAudio = ${normalizedAllow}; window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`;
+  const targetWcs = new Set();
+
+  if (targetAccountId && accountViews.has(targetAccountId)) {
+    const entry = accountViews.get(targetAccountId);
+    entry.shareAudioPreference = normalizedAllow;
+    if (entry.view && entry.view.webContents && !entry.view.webContents.isDestroyed()) {
+      targetWcs.add(entry.view.webContents);
     }
     if (entry.childWindows) {
       for (const childWin of entry.childWindows) {
         if (childWin && !childWin.isDestroyed() && !childWin._isOAuthPopup && !childWin.webContents.isDestroyed()) {
-          tasks.push(childWin.webContents.executeJavaScript(script).catch(() => {}));
+          targetWcs.add(childWin.webContents);
+        }
+      }
+    }
+  } else if (!targetWc) {
+    for (const entry of accountViews.values()) {
+      entry.shareAudioPreference = normalizedAllow;
+      if (entry.view && entry.view.webContents && !entry.view.webContents.isDestroyed()) {
+        targetWcs.add(entry.view.webContents);
+      }
+      if (entry.childWindows) {
+        for (const childWin of entry.childWindows) {
+          if (childWin && !childWin.isDestroyed() && !childWin._isOAuthPopup && !childWin.webContents.isDestroyed()) {
+            targetWcs.add(childWin.webContents);
+          }
         }
       }
     }
   }
-  await Promise.all(tasks);
+
+  if (targetWc && !targetWc.isDestroyed()) {
+    targetWcs.add(targetWc);
+  }
+
+  await Promise.all(
+    Array.from(targetWcs).map((wc) => executeJsWithTimeout(wc, script, 400))
+  );
 }
 
 // ============================================================================
@@ -1296,9 +1367,12 @@ function attachNavigationAndShortcutHandlers(entry) {
       attachContextMenu(childWc);
       const injectChildBridges = () => {
         if (childWc.isDestroyed()) return;
+        const allowShareAudio = typeof entry.shareAudioPreference === 'boolean'
+          ? entry.shareAudioPreference
+          : Boolean(lastShareAudioPreference);
         childWc.executeJavaScript(DISCORD_MEDIA_AUDIO_PATCH).catch(() => {});
         childWc.executeJavaScript(
-          `window.__discordMultiSpaceShareAudio = ${Boolean(lastShareAudioPreference)}; window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`
+          `window.__discordMultiSpaceShareAudio = ${allowShareAudio}; window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`
         ).catch(() => {});
       };
       injectChildBridges();
@@ -1411,6 +1485,7 @@ async function ensureAccountView(account) {
       isHibernated: false,
       hasProxy: proxyResult.hasProxy,
       appliedProxyRaw: normalizedProxyRaw,
+      shareAudioPreference: Boolean(lastShareAudioPreference),
       childWindows: new Set()
     };
     accountViews.set(accountId, entry);
@@ -1421,9 +1496,12 @@ async function ensureAccountView(account) {
 
     const injectBridges = () => {
       if (wc.isDestroyed()) return;
+      const allowShareAudio = typeof entry.shareAudioPreference === 'boolean'
+        ? entry.shareAudioPreference
+        : Boolean(lastShareAudioPreference);
       wc.executeJavaScript(DISCORD_MEDIA_AUDIO_PATCH).catch(() => {});
       wc.executeJavaScript(
-        `window.__discordMultiSpaceShareAudio = ${Boolean(lastShareAudioPreference)}; window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`
+        `window.__discordMultiSpaceShareAudio = ${allowShareAudio}; window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`
       ).catch(() => {});
     };
 
@@ -1798,10 +1876,23 @@ function resolveAppIconPath() {
   return path.join(__dirname, 'tray-icon.png');
 }
 
+function getOrderedDisplays() {
+  if (!screen || typeof screen.getAllDisplays !== 'function') return [];
+  const all = screen.getAllDisplays();
+  if (typeof screen.getPrimaryDisplay !== 'function') return all;
+  try {
+    const primary = screen.getPrimaryDisplay();
+    if (!primary) return all;
+    return all.map((d) => (d && d.id === primary.id ? { ...d, isPrimary: true } : d));
+  } catch {
+    return all;
+  }
+}
+
 function createWindow() {
   setupSession(session.defaultSession);
 
-  const displays = (screen && typeof screen.getAllDisplays === 'function') ? screen.getAllDisplays() : [];
+  const displays = getOrderedDisplays();
   const restored = sanitizeWindowState(mainSettings.windowState, displays, {
     width: 1280,
     height: 800,
@@ -1811,6 +1902,7 @@ function createWindow() {
   const hasRestoredCoords = Number.isFinite(restored.x) && Number.isFinite(restored.y);
   const shouldShowImmediately = !START_HIDDEN && !IS_TEST_MODE;
   pendingMaximizeOnFirstShow = !shouldShowImmediately && Boolean(restored.isMaximized);
+  lastNormalWindowMaximized = Boolean(restored.isMaximized);
 
   mainWindow = new BrowserWindow({
     ...(hasRestoredCoords ? { x: restored.x, y: restored.y } : { center: true }),
@@ -2683,8 +2775,17 @@ ipcMain.on('screen-picker-select', async (event, payload) => {
   if (!pending) return;
   pendingDisplayMediaRequests.delete(requestId);
 
-  // Synchronize __discordMultiSpaceShareAudio to all views AND non-OAuth pop-out call windows BEFORE resolving getDisplayMedia
-  await syncScreenShareAudioStateToViews(allowAudio);
+  // Synchronize __discordMultiSpaceShareAudio to the requesting account view AND its non-OAuth pop-out call windows BEFORE resolving getDisplayMedia
+  await syncScreenShareAudioStateToViews(allowAudio, pending.ownerAccountId, pending.ownerWc);
+
+  if (
+    (pending.ownerWc && pending.ownerWc.isDestroyed()) ||
+    (pending.ownerAccountId && !accountViews.has(pending.ownerAccountId)) ||
+    (pending.ownerAccountId && (accountDisplayMediaEpoch.get(pending.ownerAccountId) || 0) !== pending.accountEpoch)
+  ) {
+    try { pending.callback({}); } catch {}
+    return;
+  }
 
   const selectedSource = pending.sources.find((s) => s.id === sourceId);
   if (selectedSource) {
@@ -2724,6 +2825,7 @@ ipcMain.on('screen-picker-cancel', (event, payload) => {
 function setupAutoUpdater() {
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = false;
+  autoUpdater.disableWebInstaller = true;
 
   autoUpdater.on('checking-for-update', () => {
     log('AutoUpdater: Checking for updates...');
@@ -2731,8 +2833,10 @@ function setupAutoUpdater() {
   });
 
   autoUpdater.on('update-available', (info) => {
+    updateDownloadedReady = false;
     log(`AutoUpdater: Update available [v${info && info.version}]`);
     sendToRenderer('update-available', { ...info, manual: lastUpdateCheckManual });
+    lastUpdateCheckManual = false;
   });
 
   autoUpdater.on('update-not-available', (info) => {
@@ -2761,6 +2865,9 @@ function setupAutoUpdater() {
     if (isExplicitDownloadInFlight) {
       errorEmittedDuringDownload = true;
     }
+    if (isUpdateCheckInFlight) {
+      errorEmittedDuringCheck = true;
+    }
     sendToRenderer('update-error', {
       message: (err && err.message) || String(err),
       manual: lastUpdateCheckManual || isExplicitDownloadInFlight
@@ -2774,9 +2881,10 @@ function triggerUpdateCheck(manual = false) {
   lastUpdateCheckManual = Boolean(manual);
   log(`triggerUpdateCheck called (manual: ${lastUpdateCheckManual}, isPackaged: ${app.isPackaged})`);
 
-  if (IS_TEST_MODE) return;
+  const useRealUpdater = app.isPackaged || Boolean(autoUpdater.forceDevUpdateConfig);
+  if (IS_TEST_MODE && !autoUpdater.forceDevUpdateConfig) return;
 
-  if (!app.isPackaged) {
+  if (!useRealUpdater) {
     sendToRenderer('update-checking', { manual: lastUpdateCheckManual });
     const options = {
       hostname: 'api.github.com',
@@ -2824,10 +2932,20 @@ function triggerUpdateCheck(manual = false) {
     return;
   }
 
+  isUpdateCheckInFlight = true;
+  errorEmittedDuringCheck = false;
   autoUpdater.checkForUpdates().catch((err) => {
-    log(`checkForUpdates failed: ${err.message}`);
-    sendToRenderer('update-error', { message: err.message, manual: lastUpdateCheckManual });
+    log(`checkForUpdates failed: ${(err && err.message) || err}`);
+    if (!errorEmittedDuringCheck) {
+      sendToRenderer('update-error', {
+        message: (err && err.message) || String(err),
+        manual: lastUpdateCheckManual
+      });
+    }
     lastUpdateCheckManual = false;
+  }).finally(() => {
+    isUpdateCheckInFlight = false;
+    errorEmittedDuringCheck = false;
   });
 }
 
@@ -2838,10 +2956,10 @@ ipcMain.on('check-for-updates', (event) => {
 
 ipcMain.handle('updater:download', async (event) => {
   if (!isTrustedSender(event)) return { ok: false, error: 'Unauthorized' };
-  if (IS_TEST_MODE) {
+  if (IS_TEST_MODE && !autoUpdater.forceDevUpdateConfig) {
     return { ok: true, isTest: true };
   }
-  if (!app.isPackaged) {
+  if (!app.isPackaged && !autoUpdater.forceDevUpdateConfig) {
     shell.openExternal('https://github.com/NextGenInfluencer/discord-multispace/releases/latest').catch(() => {});
     return { ok: true, isDev: true };
   }
@@ -2951,6 +3069,8 @@ if (IS_TEST_MODE) {
     getPendingDisplayMediaRequests: () => pendingDisplayMediaRequests,
     handleDisplayMediaRequest,
     cancelPendingDisplayMediaForAccount,
+    getAutoUpdater: () => autoUpdater,
+    triggerUpdateCheck,
     getAutoUpdaterConfig: () => ({
       autoDownload: autoUpdater.autoDownload,
       autoInstallOnAppQuit: autoUpdater.autoInstallOnAppQuit

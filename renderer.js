@@ -53,16 +53,25 @@ let globalShortcutsEnabled = false;
 const accountLastActive = {};
 const accountHibernating = {};
 
+function safeGetStorageItem(key, fallback = null) {
+  try {
+    const val = localStorage.getItem(key);
+    return val !== null ? val : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 // Overlay Blocking State (for native WebContentsView z-order coordination)
 let lastOverlayBlocked = false;
 
 // Reload Button Visibility
-let showReloadBtn = localStorage.getItem(STORAGE_SHOW_RELOAD_BTN_KEY) !== 'false';
+let showReloadBtn = safeGetStorageItem(STORAGE_SHOW_RELOAD_BTN_KEY) !== 'false';
 
 // Per-account Zoom Persistence
 let accountZooms = {};
 try {
-  accountZooms = JSON.parse(localStorage.getItem(STORAGE_ZOOM_KEY) || '{}');
+  accountZooms = JSON.parse(safeGetStorageItem(STORAGE_ZOOM_KEY, '{}'));
 } catch {
   accountZooms = {};
 }
@@ -75,8 +84,8 @@ const THEME_PRESETS = {
   minimalist: { name: 'Clean Minimalist', id: 'minimalist', css: '/* Bundled locally: Clean Minimalist */' }
 };
 
-let currentThemeCss = localStorage.getItem(STORAGE_THEME_CSS_KEY) || '';
-let currentThemeId = localStorage.getItem(STORAGE_THEME_ID_KEY) || 'default';
+let currentThemeCss = safeGetStorageItem(STORAGE_THEME_CSS_KEY, '');
+let currentThemeId = safeGetStorageItem(STORAGE_THEME_ID_KEY, 'default');
 
 // ==========================================================================
 // DOM Element References
@@ -969,11 +978,23 @@ function updateModalAvatarPreview() {
   }
 }
 
+const MAX_AVATAR_FILE_BYTES = 15 * 1024 * 1024;
+
 function handleAvatarFile(file) {
   if (!file) return;
+  if (typeof file.size === 'number' && file.size > MAX_AVATAR_FILE_BYTES) {
+    showToast('Avatar image is too large (max 15 MB).', true);
+    return;
+  }
   const reader = new FileReader();
+  reader.onerror = () => {
+    showToast('Failed to read avatar image file.', true);
+  };
   reader.onload = (e) => {
     const img = new Image();
+    img.onerror = () => {
+      showToast('Invalid or unsupported image file.', true);
+    };
     img.onload = () => {
       if (!img.width || !img.height) return;
       const canvas = document.createElement('canvas');
@@ -1064,22 +1085,27 @@ function closeModal() {
   syncOverlayBlockState();
 }
 
+let isModalSubmitInFlight = false;
+let isRemoveAccountInFlight = false;
+
 async function handleModalSubmit() {
+  if (isModalSubmitInFlight) return;
   const name = inputAccountName.value.trim();
   if (!name) return;
   const proxy = inputAccountProxy.value.trim();
 
-  if (proxy) {
-    const check = await eAPI.invoke('views:validate-proxy', proxy);
-    if (!check || !check.valid) {
-      setModalProxyError((check && check.error) || 'Invalid proxy server format.');
-      return;
-    }
-  }
-  setModalProxyError('');
-
+  isModalSubmitInFlight = true;
   btnModalSubmit.disabled = true;
   try {
+    if (proxy) {
+      const check = await eAPI.invoke('views:validate-proxy', proxy);
+      if (!check || !check.valid) {
+        setModalProxyError((check && check.error) || 'Invalid proxy server format.');
+        return;
+      }
+    }
+    setModalProxyError('');
+
     if (modalMode === 'create') {
       const newId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
       const newAccount = {
@@ -1133,6 +1159,7 @@ async function handleModalSubmit() {
       closeModal();
     }
   } finally {
+    isModalSubmitInFlight = false;
     btnModalSubmit.disabled = false;
   }
 }
@@ -1162,12 +1189,14 @@ function closeRemoveAccountModal() {
 }
 
 async function confirmRemoveAccount() {
+  if (isRemoveAccountInFlight) return;
   const accountId = pendingRemoveAccountId;
   if (!accountId) return;
   const account = accounts.find((a) => a.id === accountId);
   const accountName = account ? account.name : 'Account';
   const wipeSessionData = checkboxWipeAccountData ? checkboxWipeAccountData.checked : true;
 
+  isRemoveAccountInFlight = true;
   btnRemoveAccountConfirm.disabled = true;
   try {
     await eAPI.invoke('views:remove-account', { accountId, wipeSessionData });
@@ -1225,6 +1254,7 @@ async function confirmRemoveAccount() {
     closeRemoveAccountModal();
     showToast(wipeSessionData ? `Removed ${accountName} & wiped session data` : `Removed ${accountName}`);
   } finally {
+    isRemoveAccountInFlight = false;
     btnRemoveAccountConfirm.disabled = false;
   }
 }
@@ -1441,7 +1471,7 @@ setInterval(checkMemorySaverHibernation, 30000);
 // ==========================================================================
 // Screen Share Picker & Custom Audio Device Selection
 // ==========================================================================
-let currentStreamAudioDevice = localStorage.getItem(STORAGE_STREAM_AUDIO_DEVICE) || 'loopback';
+let currentStreamAudioDevice = safeGetStorageItem(STORAGE_STREAM_AUDIO_DEVICE, 'loopback') || 'loopback';
 let currentScreenPickerRequestId = null;
 let currentScreenPickerSources = [];
 let selectedScreenPickerSourceId = null;
@@ -1684,40 +1714,63 @@ window.addEventListener('keydown', (e) => {
   if (e.isComposing || e.keyCode === 229) return;
 
   if (e.key === 'Escape') {
+    const hadMenu =
+      (contextMenu && contextMenu.classList.contains('visible')) ||
+      (reloadContextMenu && reloadContextMenu.classList.contains('visible'));
     closeContextMenu();
     closeReloadContextMenu();
-    if (modalOverlay && modalOverlay.classList.contains('active')) closeModal();
-    if (removeAccountModalOverlay && removeAccountModalOverlay.classList.contains('active')) closeRemoveAccountModal();
-    if (settingsModalOverlay && settingsModalOverlay.classList.contains('active')) closeSettingsModal();
-    if (screenPickerModal && screenPickerModal.classList.contains('active')) closeScreenPicker(true);
+    if (hadMenu) return;
+
+    // Close only the topmost open modal (matching DOM stacking order)
+    if (screenPickerModal && screenPickerModal.classList.contains('active')) {
+      closeScreenPicker(true);
+    } else if (settingsModalOverlay && settingsModalOverlay.classList.contains('active')) {
+      closeSettingsModal();
+    } else if (removeAccountModalOverlay && removeAccountModalOverlay.classList.contains('active')) {
+      closeRemoveAccountModal();
+    } else if (modalOverlay && modalOverlay.classList.contains('active')) {
+      closeModal();
+    }
     return;
   }
 
   if (e.key === 'Enter' && !e.isComposing) {
-    if (
-      modalOverlay &&
-      modalOverlay.classList.contains('active') &&
-      document.activeElement !== btnModalCancel &&
-      document.activeElement !== btnUploadAvatar &&
-      document.activeElement !== btnRemoveAvatar
-    ) {
-      e.preventDefault();
-      handleModalSubmit();
+    if (e.repeat) return;
+
+    // Dispatch Enter only to the topmost open modal (matching DOM stacking order)
+    if (screenPickerModal && screenPickerModal.classList.contains('active')) {
+      if (
+        document.activeElement !== btnScreenPickerCancel &&
+        document.activeElement !== btnScreenPickerCloseX &&
+        document.activeElement !== tabPickerScreens &&
+        document.activeElement !== tabPickerWindows &&
+        document.activeElement !== screenPickerAudioDeviceSelect
+      ) {
+        e.preventDefault();
+        submitScreenPicker();
+      }
       return;
     }
-    if (removeAccountModalOverlay && removeAccountModalOverlay.classList.contains('active') && document.activeElement !== btnRemoveAccountCancel) {
-      e.preventDefault();
-      confirmRemoveAccount();
+    if (settingsModalOverlay && settingsModalOverlay.classList.contains('active')) {
       return;
     }
-    if (
-      screenPickerModal &&
-      screenPickerModal.classList.contains('active') &&
-      document.activeElement !== btnScreenPickerCancel &&
-      document.activeElement !== btnScreenPickerCloseX
-    ) {
-      e.preventDefault();
-      submitScreenPicker();
+    if (removeAccountModalOverlay && removeAccountModalOverlay.classList.contains('active')) {
+      if (document.activeElement !== btnRemoveAccountCancel && !isRemoveAccountInFlight) {
+        e.preventDefault();
+        confirmRemoveAccount();
+      }
+      return;
+    }
+    if (modalOverlay && modalOverlay.classList.contains('active')) {
+      if (
+        document.activeElement !== btnModalCancel &&
+        document.activeElement !== btnUploadAvatar &&
+        document.activeElement !== btnRemoveAvatar &&
+        !isModalSubmitInFlight
+      ) {
+        e.preventDefault();
+        handleModalSubmit();
+      }
       return;
     }
   }
@@ -2064,12 +2117,76 @@ let availableUpdateInfo = null;
 let isUpdateDownloading = false;
 let isUpdateDownloaded = false;
 
+function handleUpdaterErrorUi(err, forcedWasDownloading = false) {
+  const wasDownloading = Boolean(isUpdateDownloading || forcedWasDownloading);
+  isUpdateDownloading = false;
+
+  if (isUpdateDownloaded && !wasDownloading) {
+    if (btnCheckUpdates) {
+      btnCheckUpdates.disabled = false;
+      if (btnCheckUpdatesText) btnCheckUpdatesText.textContent = 'Check for Updates';
+    }
+    if (err && err.manual) {
+      showToast((err && err.message) || 'Could not reach update server.', true);
+    }
+    return;
+  }
+
+  if (updaterStatusDot) updaterStatusDot.className = 'updater-dot error';
+  if (updaterStatusText) {
+    updaterStatusText.textContent = wasDownloading ? 'Update download failed' : 'Update check failed';
+  }
+  if (updaterSubtext) {
+    updaterSubtext.textContent =
+      (err && err.message) ||
+      (wasDownloading ? 'Could not download update. Click Download Update to try again.' : 'Could not connect to update server.');
+  }
+  if (updaterProgressContainer) updaterProgressContainer.style.display = 'none';
+  if (updaterProgressBar) updaterProgressBar.style.width = '0%';
+
+  const isDevRelease = Boolean(availableUpdateInfo && availableUpdateInfo.isDev);
+  if (btnDownloadUpdate) {
+    btnDownloadUpdate.disabled = false;
+    btnDownloadUpdate.textContent = isDevRelease ? 'View Release' : 'Download Update';
+  }
+  if (btnCheckUpdates) {
+    btnCheckUpdates.disabled = false;
+    if (btnCheckUpdatesText) btnCheckUpdatesText.textContent = 'Check for Updates';
+  }
+
+  if (!isUpdateDownloaded && (availableUpdateInfo || wasDownloading)) {
+    if (btnBannerAction) {
+      btnBannerAction.disabled = false;
+      btnBannerAction.textContent = isDevRelease ? 'View Release' : 'Download Update';
+      btnBannerAction.onclick = isDevRelease
+        ? () => eAPI.openExternal('https://github.com/NextGenInfluencer/discord-multispace/releases/latest')
+        : startExplicitUpdateDownload;
+    }
+    if (updateBannerDesc) {
+      updateBannerDesc.textContent = wasDownloading
+        ? 'Download failed. Click Download Update to try again.'
+        : (isDevRelease ? 'A new release is available on GitHub.' : 'Download now to upgrade when ready.');
+    }
+    if (updateBanner && updateBanner.style.display !== 'none') {
+      pushLayoutToMain(false);
+    }
+  }
+
+  if ((err && err.manual) || wasDownloading) {
+    showToast((err && err.message) || (wasDownloading ? 'Update download failed.' : 'Could not reach update server.'), true);
+  }
+}
+
 async function startExplicitUpdateDownload() {
+  if (isUpdateDownloading) return;
   if (availableUpdateInfo && availableUpdateInfo.isDev) {
     eAPI.openExternal('https://github.com/NextGenInfluencer/discord-multispace/releases/latest');
     return;
   }
   isUpdateDownloading = true;
+  if (btnCheckUpdates) {
+    btnCheckUpdates.disabled = true;
+  }
   if (btnDownloadUpdate) {
     btnDownloadUpdate.disabled = true;
     btnDownloadUpdate.textContent = 'Downloading...';
@@ -2085,31 +2202,44 @@ async function startExplicitUpdateDownload() {
   if (updaterStatusText) updaterStatusText.textContent = 'Downloading update...';
   if (updaterProgressContainer) updaterProgressContainer.style.display = 'block';
   if (updaterProgressBar) updaterProgressBar.style.width = '0%';
-  const res = await eAPI.invoke('updater:download');
-  if (res && res.isDev) {
-    isUpdateDownloading = false;
-    if (updaterProgressContainer) updaterProgressContainer.style.display = 'none';
-    if (btnDownloadUpdate) {
-      btnDownloadUpdate.disabled = false;
-      btnDownloadUpdate.textContent = 'View Release';
+
+  try {
+    const res = await eAPI.invoke('updater:download');
+    if (res && res.isDev) {
+      isUpdateDownloading = false;
+      if (btnCheckUpdates) btnCheckUpdates.disabled = false;
+      if (updaterProgressContainer) updaterProgressContainer.style.display = 'none';
+      if (btnDownloadUpdate) {
+        btnDownloadUpdate.disabled = false;
+        btnDownloadUpdate.textContent = 'View Release';
+      }
+      if (btnBannerAction) {
+        btnBannerAction.disabled = false;
+        btnBannerAction.textContent = 'View Release';
+      }
+      if (updateBannerDesc) {
+        updateBannerDesc.textContent = 'A new release is available on GitHub.';
+      }
+      if (updaterStatusDot) updaterStatusDot.className = 'updater-dot available';
+      if (updaterStatusText) {
+        const v = availableUpdateInfo && availableUpdateInfo.version ? `v${availableUpdateInfo.version}` : 'New Release';
+        updaterStatusText.textContent = `Update available (${v})`;
+      }
+      return;
     }
-    if (btnBannerAction) {
-      btnBannerAction.disabled = false;
-      btnBannerAction.textContent = 'View Release';
+    if (res && res.ok === false && isUpdateDownloading) {
+      handleUpdaterErrorUi({ message: res.error || 'Update download failed.', manual: true }, true);
     }
-    if (updateBannerDesc) {
-      updateBannerDesc.textContent = 'A new release is available on GitHub.';
-    }
-    if (updaterStatusDot) updaterStatusDot.className = 'updater-dot available';
-    if (updaterStatusText) {
-      const v = availableUpdateInfo && availableUpdateInfo.version ? `v${availableUpdateInfo.version}` : 'New Release';
-      updaterStatusText.textContent = `Update available (${v})`;
+  } catch (err) {
+    if (isUpdateDownloading) {
+      handleUpdaterErrorUi({ message: (err && err.message) || 'Update download failed.', manual: true }, true);
     }
   }
 }
 
 if (btnCheckUpdates) {
   btnCheckUpdates.addEventListener('click', () => {
+    if (isUpdateDownloading) return;
     btnCheckUpdates.disabled = true;
     if (btnCheckUpdatesText) btnCheckUpdatesText.textContent = 'Checking...';
     eAPI.send('check-for-updates');
@@ -2136,6 +2266,7 @@ if (btnBannerDismiss && updateBanner) {
 }
 
 eAPI.on('update-checking', () => {
+  if (isUpdateDownloading || isUpdateDownloaded) return;
   if (updaterStatusDot) updaterStatusDot.className = 'updater-dot checking';
   if (updaterStatusText) updaterStatusText.textContent = 'Checking for updates...';
   if (updaterSubtext) updaterSubtext.textContent = 'Querying GitHub releases repository...';
@@ -2154,7 +2285,9 @@ eAPI.on('update-available', (info) => {
       : 'Click Download Update to fetch the installer.';
   }
   if (updaterProgressContainer) updaterProgressContainer.style.display = 'none';
+  if (btnInstallUpdate) btnInstallUpdate.style.display = 'none';
   if (btnCheckUpdates) {
+    btnCheckUpdates.style.display = 'inline-flex';
     btnCheckUpdates.disabled = false;
     if (btnCheckUpdatesText) btnCheckUpdatesText.textContent = 'Check for Updates';
   }
@@ -2185,6 +2318,7 @@ eAPI.on('update-available', (info) => {
 eAPI.on('update-not-available', (info) => {
   availableUpdateInfo = null;
   isUpdateDownloading = false;
+  if (isUpdateDownloaded) return;
   if (updaterStatusDot) updaterStatusDot.className = 'updater-dot';
   if (updaterStatusText) updaterStatusText.textContent = 'Up to date';
   if (updaterSubtext) updaterSubtext.textContent = 'You are running the latest version of Discord MultiSpace.';
@@ -2194,6 +2328,10 @@ eAPI.on('update-not-available', (info) => {
     btnCheckUpdates.style.display = 'inline-flex';
     btnCheckUpdates.disabled = false;
     if (btnCheckUpdatesText) btnCheckUpdatesText.textContent = 'Check for Updates';
+  }
+  if (updateBanner && updateBanner.style.display !== 'none') {
+    updateBanner.style.display = 'none';
+    pushLayoutToMain(false);
   }
   if (info && info.manual) {
     showToast('Discord MultiSpace is up to date!');
@@ -2254,56 +2392,7 @@ eAPI.on('update-downloaded', (info) => {
 });
 
 eAPI.on('update-error', (err) => {
-  const wasDownloading = isUpdateDownloading;
-  isUpdateDownloading = false;
-
-  if (isUpdateDownloaded && (!err || !err.manual) && !wasDownloading) {
-    return;
-  }
-
-  if (updaterStatusDot) updaterStatusDot.className = 'updater-dot error';
-  if (updaterStatusText) {
-    updaterStatusText.textContent = wasDownloading ? 'Update download failed' : 'Update check failed';
-  }
-  if (updaterSubtext) {
-    updaterSubtext.textContent =
-      (err && err.message) ||
-      (wasDownloading ? 'Could not download update. Click Download Update to try again.' : 'Could not connect to update server.');
-  }
-  if (updaterProgressContainer) updaterProgressContainer.style.display = 'none';
-  if (updaterProgressBar) updaterProgressBar.style.width = '0%';
-
-  const isDevRelease = Boolean(availableUpdateInfo && availableUpdateInfo.isDev);
-  if (btnDownloadUpdate) {
-    btnDownloadUpdate.disabled = false;
-    btnDownloadUpdate.textContent = isDevRelease ? 'View Release' : 'Download Update';
-  }
-  if (btnCheckUpdates) {
-    btnCheckUpdates.disabled = false;
-    if (btnCheckUpdatesText) btnCheckUpdatesText.textContent = 'Check for Updates';
-  }
-
-  if (!isUpdateDownloaded) {
-    if (btnBannerAction) {
-      btnBannerAction.disabled = false;
-      btnBannerAction.textContent = isDevRelease ? 'View Release' : 'Download Update';
-      btnBannerAction.onclick = isDevRelease
-        ? () => eAPI.openExternal('https://github.com/NextGenInfluencer/discord-multispace/releases/latest')
-        : startExplicitUpdateDownload;
-    }
-    if (updateBannerDesc) {
-      updateBannerDesc.textContent = wasDownloading
-        ? 'Download failed. Click Download Update to try again.'
-        : (isDevRelease ? 'A new release is available on GitHub.' : 'Download now to upgrade when ready.');
-    }
-    if (updateBanner && updateBanner.style.display !== 'none') {
-      pushLayoutToMain(false);
-    }
-  }
-
-  if ((err && err.manual) || wasDownloading) {
-    showToast((err && err.message) || (wasDownloading ? 'Update download failed.' : 'Could not reach update server.'), true);
-  }
+  handleUpdaterErrorUi(err, false);
 });
 
 // ==========================================================================
@@ -2311,7 +2400,7 @@ eAPI.on('update-error', (err) => {
 // ==========================================================================
 async function bootApplication() {
   try {
-    const raw = localStorage.getItem(STORAGE_ACCOUNTS_KEY);
+    const raw = safeGetStorageItem(STORAGE_ACCOUNTS_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) accounts = parsed;
@@ -2325,7 +2414,7 @@ async function bootApplication() {
     saveAccounts();
   }
 
-  const savedActiveId = localStorage.getItem(STORAGE_ACTIVE_ID_KEY);
+  const savedActiveId = safeGetStorageItem(STORAGE_ACTIVE_ID_KEY);
   if (savedActiveId && accounts.some((acc) => acc.id === savedActiveId)) {
     activeAccountId = savedActiveId;
   } else {
@@ -2333,7 +2422,7 @@ async function bootApplication() {
     saveActiveAccountId(activeAccountId);
   }
 
-  const savedMemSaver = localStorage.getItem('multispace_memory_saver');
+  const savedMemSaver = safeGetStorageItem('multispace_memory_saver');
   memorySaverEnabled = savedMemSaver !== null ? savedMemSaver === 'true' : true;
   if (toggleMemorySaver) toggleMemorySaver.checked = memorySaverEnabled;
 

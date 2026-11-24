@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
@@ -555,76 +556,177 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
     // 9. Verify Updater Error Recovery, Pop-Out Share Audio Sync, Orphaned Screen Picker Cleanup, IME/Quota/WebP & Window Persistence
     console.log('[E2E 9/9] Checking Updater Error Recovery, Pop-Out Audio Sync, Orphaned Screen Picker, IME/Quota/WebP & Window State...');
 
-    // 9a. Updater update-error UI recovery after explicit download failure
-    win.webContents.send('update-available', { version: '2.1.0', manual: false });
-    await waitFor(async () => {
-      const disp = await win.webContents.executeJavaScript('document.getElementById("update-notification-banner").style.display');
-      return disp === 'block';
-    });
-    await win.webContents.executeJavaScript('document.getElementById("btn-banner-action").click()');
-    win.webContents.send('update-download-progress', {
-      percent: 45,
-      bytesPerSecond: 2 * 1024 * 1024,
-      transferred: 18 * 1024 * 1024,
-      total: 40 * 1024 * 1024
-    });
-    const downloadingState = await waitFor(async () => {
-      const s = await win.webContents.executeJavaScript(`({
-        progressDisplay: document.getElementById('updater-progress-container').style.display,
-        bannerDisabled: document.getElementById('btn-banner-action').disabled,
-        bannerText: document.getElementById('btn-banner-action').textContent,
-        bannerDesc: document.getElementById('update-banner-desc').textContent,
-        settingsBtnDisabled: document.getElementById('btn-download-update').disabled
-      })`);
-      return s.progressDisplay === 'block' && s.bannerDisabled === true ? s : null;
-    });
-    assert.equal(downloadingState.bannerText, 'Downloading...');
-    assert.equal(downloadingState.settingsBtnDisabled, true);
-    assert.match(downloadingState.bannerDesc, /Downloading/i);
+    // 9a. Real electron-updater HTTP check & mid-stream download failure deduplication + UI recovery
+    await win.webContents.executeJavaScript(`
+      window.__e2eUpdateErrorCount = 0;
+      window.electronAPI.on('update-error', () => { window.__e2eUpdateErrorCount += 1; });
+      true;
+    `);
 
-    win.webContents.send('update-error', { message: 'net::ERR_CONNECTION_RESET', manual: true });
-    const recoveredUpdaterState = await waitFor(async () => {
-      const s = await win.webContents.executeJavaScript(`({
-        progressDisplay: document.getElementById('updater-progress-container').style.display,
-        progressWidth: document.getElementById('updater-progress-bar').style.width,
-        bannerDisabled: document.getElementById('btn-banner-action').disabled,
-        bannerText: document.getElementById('btn-banner-action').textContent,
-        bannerDesc: document.getElementById('update-banner-desc').textContent,
-        settingsBtnDisabled: document.getElementById('btn-download-update').disabled,
-        settingsBtnText: document.getElementById('btn-download-update').textContent,
-        statusText: document.getElementById('updater-status-text').textContent
-      })`);
-      return s.progressDisplay === 'none' && s.bannerDisabled === false ? s : null;
-    });
-    assert.equal(recoveredUpdaterState.progressWidth, '0%', 'Progress bar width must reset on update-error');
-    assert.equal(recoveredUpdaterState.bannerText, 'Download Update', 'Banner action button must recover on update-error');
-    assert.equal(recoveredUpdaterState.settingsBtnDisabled, false, 'Settings download button must re-enable on update-error');
-    assert.equal(recoveredUpdaterState.settingsBtnText, 'Download Update');
-    assert.equal(recoveredUpdaterState.bannerDesc.includes('Downloading'), false, 'Banner desc must not stay stuck in Downloading...');
-    assert.equal(recoveredUpdaterState.statusText, 'Update download failed');
-    await win.webContents.executeJavaScript('document.getElementById("btn-banner-dismiss").click()');
-
-    // 9b. Pop-Out Call Window Share Audio sync & Orphaned Screen Picker cleanup on reload/account removal
-    const origGetSources = desktopCapturer.getSources.bind(desktopCapturer);
-    desktopCapturer.getSources = async () => [
-      {
-        id: 'screen:0:0',
-        name: 'Entire Screen',
-        display_id: '0',
-        thumbnail: { isEmpty: () => true, toDataURL: () => '' },
-        appIcon: null
-      },
-      {
-        id: 'window:42:0',
-        name: 'Test Game Window',
-        display_id: '',
-        thumbnail: { isEmpty: () => true, toDataURL: () => '' },
-        appIcon: null
+    const fakeExePayload = Buffer.alloc(128 * 1024, 0x4d);
+    const fakeExeSha512 = crypto.createHash('sha512').update(fakeExePayload).digest('base64');
+    let failLatestYml = true;
+    let abortExeDownloadMidStream = true;
+    const updateServer = http.createServer((req, res) => {
+      if (req.url && req.url.startsWith('/latest.yml')) {
+        if (failLatestYml) {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+          res.end('Internal Server Error');
+          return;
+        }
+        const yml = [
+          'version: 99.0.0',
+          'files:',
+          '  - url: Discord-MultiSpace-Setup-99.0.0.exe',
+          `    sha512: ${fakeExeSha512}`,
+          `    size: ${fakeExePayload.length}`,
+          'path: Discord-MultiSpace-Setup-99.0.0.exe',
+          `sha512: ${fakeExeSha512}`,
+          "releaseDate: '2026-11-24T00:00:00.000Z'"
+        ].join('\n');
+        res.writeHead(200, { 'Content-Type': 'text/yaml' });
+        res.end(yml);
+        return;
       }
-    ];
+      if (req.url && req.url.includes('Discord-MultiSpace-Setup-99.0.0.exe') && !req.url.includes('.blockmap')) {
+        res.writeHead(200, {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(fakeExePayload.length)
+        });
+        if (abortExeDownloadMidStream) {
+          res.write(fakeExePayload.subarray(0, 48 * 1024));
+          setTimeout(() => res.destroy(new Error('Simulated mid-stream reset')), 40);
+          return;
+        }
+        res.end(fakeExePayload);
+        return;
+      }
+      res.writeHead(404);
+      res.end('Not found');
+    });
+    await new Promise((resolve) => updateServer.listen(0, '127.0.0.1', resolve));
+    const updateFeedUrl = `http://127.0.0.1:${updateServer.address().port}`;
+
+    const realAutoUpdater = hooks.getAutoUpdater();
+    const updaterCacheDirName = `multispace-e2e-updater-cache-${Date.now()}-${process.pid}`;
+    const devUpdateCfgPath = path.join(tempUserData, 'dev-app-update.yml');
+    fs.writeFileSync(
+      devUpdateCfgPath,
+      `provider: generic\nurl: ${updateFeedUrl}\nupdaterCacheDirName: ${updaterCacheDirName}\n`,
+      'utf8'
+    );
+    realAutoUpdater.forceDevUpdateConfig = true;
+    realAutoUpdater.updateConfigPath = devUpdateCfgPath;
+    realAutoUpdater.setFeedURL({ provider: 'generic', url: updateFeedUrl });
 
     try {
-      // Open a Pop-Out Call Window on Account 1 and verify DISCORD_MEDIA_AUDIO_PATCH + Share Audio sync
+      // 9a-i. Failing checkForUpdates() must emit update-error ONCE (no emit+catch duplication)
+      hooks.triggerUpdateCheck(true);
+      await waitFor(async () => {
+        const c = await win.webContents.executeJavaScript('window.__e2eUpdateErrorCount');
+        return c >= 1;
+      }, 'Expected update-error on HTTP 500 latest.yml');
+      await new Promise((r) => setTimeout(r, 120));
+      const checkErrCount = await win.webContents.executeJavaScript('window.__e2eUpdateErrorCount');
+      assert.equal(checkErrCount, 1, 'Failed autoUpdater.checkForUpdates() must emit update-error exactly once');
+
+      // 9a-ii. Successful checkForUpdates() -> explicit downloadUpdate() -> mid-stream TCP reset -> single update-error + full UI recovery
+      failLatestYml = false;
+      hooks.triggerUpdateCheck(true);
+      await waitFor(async () => {
+        const disp = await win.webContents.executeJavaScript('document.getElementById("update-notification-banner").style.display');
+        return disp === 'block';
+      }, 'Expected real update-available banner from local feed');
+
+      await win.webContents.executeJavaScript('window.__e2eUpdateErrorCount = 0; document.getElementById("btn-banner-action").click();');
+      await waitFor(async () => {
+        const c = await win.webContents.executeJavaScript('window.__e2eUpdateErrorCount');
+        return c >= 1;
+      }, 'Expected real downloadUpdate() mid-stream TCP reset to emit update-error');
+      await new Promise((r) => setTimeout(r, 150));
+
+      const downloadErrCount = await win.webContents.executeJavaScript('window.__e2eUpdateErrorCount');
+      assert.equal(downloadErrCount, 1, 'Failed autoUpdater.downloadUpdate() must emit update-error exactly once');
+
+      const recoveredUpdaterState = await waitFor(async () => {
+        const s = await win.webContents.executeJavaScript(`({
+          progressDisplay: document.getElementById('updater-progress-container').style.display,
+          progressWidth: document.getElementById('updater-progress-bar').style.width,
+          bannerDisabled: document.getElementById('btn-banner-action').disabled,
+          bannerText: document.getElementById('btn-banner-action').textContent,
+          bannerDesc: document.getElementById('update-banner-desc').textContent,
+          settingsBtnDisabled: document.getElementById('btn-download-update').disabled,
+          settingsBtnText: document.getElementById('btn-download-update').textContent,
+          checkBtnDisabled: document.getElementById('btn-check-updates').disabled,
+          statusText: document.getElementById('updater-status-text').textContent
+        })`);
+        return s.progressDisplay === 'none' && s.bannerDisabled === false ? s : null;
+      });
+      assert.equal(recoveredUpdaterState.progressWidth, '0%', 'Progress bar width must reset on update-error');
+      assert.equal(recoveredUpdaterState.bannerText, 'Download Update', 'Banner action button must recover on update-error');
+      assert.equal(recoveredUpdaterState.settingsBtnDisabled, false, 'Settings download button must re-enable on update-error');
+      assert.equal(recoveredUpdaterState.checkBtnDisabled, false, 'Check for Updates button must re-enable on update-error');
+      assert.equal(recoveredUpdaterState.settingsBtnText, 'Download Update');
+      assert.equal(recoveredUpdaterState.bannerDesc.includes('Downloading'), false, 'Banner desc must not stay stuck in Downloading...');
+      assert.equal(recoveredUpdaterState.statusText, 'Update download failed');
+
+      // 9a-iii. Retry download after failure succeeds cleanly via real electron-updater!
+      abortExeDownloadMidStream = false;
+      await win.webContents.executeJavaScript('document.getElementById("btn-banner-action").click()');
+      await waitFor(async () => {
+        const text = await win.webContents.executeJavaScript('document.getElementById("btn-banner-action").textContent');
+        return text === 'Install & Restart';
+      }, 'Retry after failed download must complete and reach Install & Restart state');
+
+      // Verify manual update-error after update is already downloaded does NOT clobber Install & Restart state
+      win.webContents.send('update-error', { message: 'Offline check', manual: true });
+      await new Promise((r) => setTimeout(r, 80));
+      const postDownloadState = await win.webContents.executeJavaScript(`({
+        bannerText: document.getElementById('btn-banner-action').textContent,
+        installVisible: document.getElementById('btn-install-update').style.display
+      })`);
+      assert.equal(postDownloadState.bannerText, 'Install & Restart', 'Ready-to-install banner must not be clobbered by later check error');
+      assert.equal(postDownloadState.installVisible, 'inline-block');
+      await win.webContents.executeJavaScript('document.getElementById("btn-banner-dismiss").click()');
+    } finally {
+      realAutoUpdater.forceDevUpdateConfig = false;
+      updateServer.close();
+      try {
+        if (process.env.LOCALAPPDATA) {
+          fs.rmSync(path.join(process.env.LOCALAPPDATA, updaterCacheDirName), { recursive: true, force: true });
+        }
+      } catch {}
+    }
+
+    // 9b. Pop-Out Call Window Share Audio sync (real getDisplayMedia track test + Split-View account isolation) & Orphaned Screen Picker races
+    const origGetSources = desktopCapturer.getSources.bind(desktopCapturer);
+    let getSourcesDelayMs = 0;
+    desktopCapturer.getSources = async () => {
+      const delay = getSourcesDelayMs;
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      return [
+        {
+          id: 'screen:0:0',
+          name: 'Entire Screen',
+          display_id: '0',
+          thumbnail: { isEmpty: () => true, toDataURL: () => '' },
+          appIcon: null
+        },
+        {
+          id: 'window:42:0',
+          name: 'Test Game Window',
+          display_id: '',
+          thumbnail: { isEmpty: () => true, toDataURL: () => '' },
+          appIcon: null
+        }
+      ];
+    };
+
+    try {
+      // Configure custom audio device ('Voicemeeter Out B2') to verify Pop-Out respects unchecked & checked Share Audio
+      await win.webContents.executeJavaScript('window.electronAPI.send("set-stream-audio-device", "Voicemeeter Out B2")');
+      await new Promise((r) => setTimeout(r, 80));
+
       const winsBeforeAudioPopout = BrowserWindow.getAllWindows().length;
       await acc1Entry.view.webContents.executeJavaScript(
         'window.__audioPop = window.open("about:blank", "discord_call_popout_audio", "width=420,height=320"); true;'
@@ -634,8 +736,10 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
       assert.ok(audioPopoutWin, 'Expected Pop-Out call BrowserWindow');
 
       await waitFor(async () => {
-        return await audioPopoutWin.webContents.executeJavaScript('Boolean(window.__discordMultiSpaceAudioPatched)');
-      }, 'DISCORD_MEDIA_AUDIO_PATCH injected into about:blank Pop-Out window');
+        return await audioPopoutWin.webContents.executeJavaScript(
+          'Boolean(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia && navigator.mediaDevices.getDisplayMedia.__discordMultiSpacePatched)'
+        );
+      }, 'DISCORD_MEDIA_AUDIO_PATCH must wrap navigator.mediaDevices.getDisplayMedia inside about:blank Pop-Out window');
 
       // Trigger displayMedia request from Pop-Out window and select source with Share Audio UNCHECKED (false)
       let resolvedMedia1 = null;
@@ -668,7 +772,7 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
         'screen-picker-select must sync window.__discordMultiSpaceShareAudio = false to Pop-Out call windows'
       );
 
-      // Invalidate 2s auto-fulfill cache by waiting or clearing via a fresh selection check with Share Audio = true
+      // Re-select on Account 1 Pop-Out with Share Audio = true
       await new Promise((r) => setTimeout(r, 2050));
       let resolvedMedia2 = null;
       await hooks.handleDisplayMediaRequest(
@@ -690,44 +794,9 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
       `);
       await waitFor(() => resolvedMedia2 !== null);
       assert.equal(resolvedMedia2.audio, 'loopback');
-      const popoutShareAudioTrue = await audioPopoutWin.webContents.executeJavaScript('window.__discordMultiSpaceShareAudio');
-      assert.equal(
-        popoutShareAudioTrue,
-        true,
-        'screen-picker-select must sync window.__discordMultiSpaceShareAudio = true back to Pop-Out call windows'
-      );
-      audioPopoutWin.destroy();
+      assert.equal(await audioPopoutWin.webContents.executeJavaScript('window.__discordMultiSpaceShareAudio'), true);
 
-      // 9c. Orphaned Screen Picker modal closes automatically on Account Reload AND on Account Removal
-      await new Promise((r) => setTimeout(r, 2050));
-      let reloadCancelledResult = null;
-      await hooks.handleDisplayMediaRequest(
-        { frame: acc1Entry.view.webContents.mainFrame, securityOrigin: 'https://discord.com' },
-        (selection) => {
-          reloadCancelledResult = selection;
-        },
-        acc1Entry.view.webContents.session
-      );
-      await waitFor(() => hooks.getPendingDisplayMediaRequests().size === 1 && hooks.getLayoutState().overlayBlocked === true);
-
-      // Reload Account 1 while Screen Picker modal is open -> must emit cancel-screen-picker & unblock overlay!
-      await win.webContents.executeJavaScript('window.electronAPI.send("views:reload-account", { accountId: "1", ignoreCache: false })');
-      await waitFor(async () => {
-        const pickerOpen = await win.webContents.executeJavaScript(
-          'document.getElementById("screen-picker-modal-overlay").classList.contains("active")'
-        );
-        return !pickerOpen && hooks.getLayoutState().overlayBlocked === false && hooks.getPendingDisplayMediaRequests().size === 0;
-      }, 'Reloading account while Screen Picker is open must close modal and unblock overlay');
-      assert.deepEqual(reloadCancelledResult, {}, 'Cancelled displayMedia request must resolve empty object');
-
-      // Wait for Account 1 to finish reload, then add temp account, open Screen Picker on it, and remove that account!
-      await waitFor(async () => {
-        const text = await acc1Entry.view.webContents.executeJavaScript(
-          'document.getElementById("mock-discord") ? document.getElementById("mock-discord").textContent : ""'
-        );
-        return text.includes('Mock Discord Loaded');
-      });
-
+      // Verify Split-View cross-account isolation: Account 2 selecting Share Audio = false must NOT overwrite Account 1's Pop-Out Share Audio = true!
       await win.webContents.executeJavaScript(`
         (async () => {
           accounts.push({ id: 'temp_picker', name: 'Temp Picker Acc', color: '#23A55A', proxy: '' });
@@ -745,17 +814,63 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
         return text.includes('Mock Discord Loaded');
       });
 
-      let removeCancelledResult = null;
+      let tempResolved = null;
       await hooks.handleDisplayMediaRequest(
         { frame: tempEntry.view.webContents.mainFrame, securityOrigin: 'https://discord.com' },
-        (selection) => {
-          removeCancelledResult = selection;
-        },
+        (selection) => { tempResolved = selection; },
         tempEntry.view.webContents.session
       );
+      await waitFor(async () => {
+        return await win.webContents.executeJavaScript(
+          'document.getElementById("screen-picker-modal-overlay").classList.contains("active")'
+        );
+      });
+      await win.webContents.executeJavaScript(`
+        selectScreenPickerSource('window:42:0');
+        document.getElementById('screen-picker-audio-toggle').checked = false;
+        submitScreenPicker();
+      `);
+      await waitFor(() => tempResolved !== null);
+      assert.equal(await tempEntry.view.webContents.executeJavaScript('window.__discordMultiSpaceShareAudio'), false);
+      assert.equal(
+        await audioPopoutWin.webContents.executeJavaScript('window.__discordMultiSpaceShareAudio'),
+        true,
+        'Account 2 video-only stream must NOT mute Account 1 Pop-Out Share Audio state'
+      );
+      audioPopoutWin.destroy();
+      await win.webContents.executeJavaScript('window.electronAPI.send("set-stream-audio-device", "loopback")');
+
+      // 9c. Orphaned Screen Picker modal cleanup + Concurrent Split-View superseding & slow getSources() races
+      await new Promise((r) => setTimeout(r, 2050));
+
+      // 9c-i. Account 1 opens Screen Picker, Account 2 immediately supersedes it, then Account 1 reloads -> Account 2's picker MUST stay open!
+      let supersededAcc1Res = null;
+      let activeAcc2Res = null;
+      await hooks.handleDisplayMediaRequest(
+        { frame: acc1Entry.view.webContents.mainFrame, securityOrigin: 'https://discord.com' },
+        (selection) => { supersededAcc1Res = selection; },
+        acc1Entry.view.webContents.session
+      );
+      await waitFor(() => hooks.getPendingDisplayMediaRequests().size === 1);
+
+      await hooks.handleDisplayMediaRequest(
+        { frame: tempEntry.view.webContents.mainFrame, securityOrigin: 'https://discord.com' },
+        (selection) => { activeAcc2Res = selection; },
+        tempEntry.view.webContents.session
+      );
+      assert.deepEqual(supersededAcc1Res, {}, 'Superseded Account 1 request must resolve empty');
       await waitFor(() => hooks.getPendingDisplayMediaRequests().size === 1 && hooks.getLayoutState().overlayBlocked === true);
 
-      // Remove temp_picker while its Screen Picker modal is open -> must close modal & unblock overlay!
+      // Reload Account 1 while Account 2's Screen Picker is active -> Account 2's picker MUST NOT close!
+      await win.webContents.executeJavaScript('window.electronAPI.send("views:reload-account", { accountId: "1", ignoreCache: false })');
+      await new Promise((r) => setTimeout(r, 150));
+      const acc2PickerStillOpen = await win.webContents.executeJavaScript(
+        'document.getElementById("screen-picker-modal-overlay").classList.contains("active")'
+      );
+      assert.equal(acc2PickerStillOpen, true, 'Reloading Account 1 must NOT dismiss Account 2 active Screen Picker');
+      assert.equal(activeAcc2Res, null);
+
+      // Now remove Account 2 (temp_picker) while its Screen Picker is open -> MUST close modal & unblock overlay!
       await win.webContents.executeJavaScript(`
         (async () => {
           await window.electronAPI.invoke('views:remove-account', { accountId: 'temp_picker', wipeSessionData: true });
@@ -770,12 +885,57 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
         );
         return !pickerOpen && hooks.getLayoutState().overlayBlocked === false && hooks.getPendingDisplayMediaRequests().size === 0;
       }, 'Removing account while Screen Picker is open must close modal and unblock overlay');
-      assert.deepEqual(removeCancelledResult, {});
+      assert.deepEqual(activeAcc2Res, {});
+
+      // Wait for Account 1 reload to settle, then verify reloading Account 1 while its own picker is open closes modal!
+      await waitFor(async () => {
+        const text = await acc1Entry.view.webContents.executeJavaScript(
+          'document.getElementById("mock-discord") ? document.getElementById("mock-discord").textContent : ""'
+        );
+        return text.includes('Mock Discord Loaded');
+      });
+
+      let reloadCancelledResult = null;
+      await hooks.handleDisplayMediaRequest(
+        { frame: acc1Entry.view.webContents.mainFrame, securityOrigin: 'https://discord.com' },
+        (selection) => { reloadCancelledResult = selection; },
+        acc1Entry.view.webContents.session
+      );
+      await waitFor(() => hooks.getPendingDisplayMediaRequests().size === 1 && hooks.getLayoutState().overlayBlocked === true);
+      await win.webContents.executeJavaScript('window.electronAPI.send("views:reload-account", { accountId: "1", ignoreCache: false })');
+      await waitFor(async () => {
+        const pickerOpen = await win.webContents.executeJavaScript(
+          'document.getElementById("screen-picker-modal-overlay").classList.contains("active")'
+        );
+        return !pickerOpen && hooks.getLayoutState().overlayBlocked === false && hooks.getPendingDisplayMediaRequests().size === 0;
+      }, 'Reloading account while its Screen Picker is open must close modal and unblock overlay');
+      assert.deepEqual(reloadCancelledResult, {});
+
+      // Also verify reload DURING slow getSources() aborts cleanly without opening Screen Picker
+      await waitFor(async () => {
+        const text = await acc1Entry.view.webContents.executeJavaScript(
+          'document.getElementById("mock-discord") ? document.getElementById("mock-discord").textContent : ""'
+        );
+        return text.includes('Mock Discord Loaded');
+      });
+      getSourcesDelayMs = 160;
+      let midEnumCancelled = null;
+      const midEnumPromise = hooks.handleDisplayMediaRequest(
+        { frame: acc1Entry.view.webContents.mainFrame, securityOrigin: 'https://discord.com' },
+        (selection) => { midEnumCancelled = selection; },
+        acc1Entry.view.webContents.session
+      );
+      await new Promise((r) => setTimeout(r, 30));
+      hooks.cancelPendingDisplayMediaForAccount('1', 'test-mid-enum-reload');
+      await midEnumPromise;
+      getSourcesDelayMs = 0;
+      assert.deepEqual(midEnumCancelled, {}, 'Cancelling account mid-getSources() must abort without opening picker');
+      assert.equal(hooks.getPendingDisplayMediaRequests().size, 0);
     } finally {
       desktopCapturer.getSources = origGetSources;
     }
 
-    // 9d. Modal Enter IME composition guard (!e.isComposing), WebP avatar crop, & localStorage quota resilience
+    // 9d. Modal Enter IME composition guard, double/repeat Enter re-entrancy guard, topmost Escape order, WebP crop & quota resilience
     await win.webContents.executeJavaScript('document.getElementById("btn-add-account").click()');
     await waitFor(() => hooks.getLayoutState().overlayBlocked === true);
 
@@ -792,6 +952,12 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
 
         const modalStillOpenAfterIme = document.getElementById('modal-overlay').classList.contains('active');
         const accountsAfterIme = accounts.length;
+
+        // Open Settings modal on top of Add Account modal and press Escape -> ONLY Settings modal should close!
+        await openSettingsModal();
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+        const settingsClosedFirst = !document.getElementById('settings-modal-overlay').classList.contains('active');
+        const addModalremainedOpen = document.getElementById('modal-overlay').classList.contains('active');
 
         // Generate a synthetic 96x64 PNG File and run handleAvatarFile(file) -> must encode data:image/webp
         const srcCanvas = document.createElement('canvas');
@@ -810,7 +976,27 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
         }
         const encodedAvatarPrefix = currentAvatarDataUrl ? currentAvatarDataUrl.slice(0, 23) : '';
 
-        closeModal();
+        // Dispatch rapid triple Enter (including e.repeat = true) -> must create AT MOST ONE account (no re-entrant duplicates)!
+        document.getElementById('input-account-name').value = 'SingleSubmitAcc';
+        document.getElementById('input-account-name').focus();
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', repeat: true, bubbles: true, cancelable: true }));
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+
+        const waitSubmitStart = Date.now();
+        while (document.getElementById('modal-overlay').classList.contains('active') && Date.now() - waitSubmitStart < 4000) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        const createdMatches = accounts.filter((a) => a.name === 'SingleSubmitAcc');
+        const singleAccountCreated = createdMatches.length === 1;
+
+        // Clean up the test account
+        if (createdMatches[0]) {
+          await window.electronAPI.invoke('views:remove-account', { accountId: createdMatches[0].id, wipeSessionData: true });
+          accounts = accounts.filter((a) => a.id !== createdMatches[0].id);
+          saveAccounts();
+          renderAccountStack();
+        }
 
         // Simulate localStorage QuotaExceededError inside saveAccounts() -> must return false without throwing!
         const origSetItem = Storage.prototype.setItem;
@@ -828,6 +1014,9 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
         return {
           modalStillOpenAfterIme,
           accountsUnchanged: accountsBeforeIme === accountsAfterIme,
+          settingsClosedFirst,
+          addModalremainedOpen,
+          singleAccountCreated,
           encodedAvatarPrefix,
           quotaCaughtCleanly
         };
@@ -835,11 +1024,14 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
     `);
     assert.equal(imeAndWebpResult.modalStillOpenAfterIme, true, 'IME composition Enter/Escape must not submit or dismiss modal');
     assert.equal(imeAndWebpResult.accountsUnchanged, true, 'IME Enter must not create an account prematurely');
+    assert.equal(imeAndWebpResult.settingsClosedFirst, true, 'Escape must close topmost Settings modal');
+    assert.equal(imeAndWebpResult.addModalremainedOpen, true, 'Escape must not close underlying modal simultaneously');
+    assert.equal(imeAndWebpResult.singleAccountCreated, true, 'Rapid double/repeat Enter must create exactly 1 account');
     assert.equal(imeAndWebpResult.encodedAvatarPrefix, 'data:image/webp;base64,', 'Avatar crops must encode compact image/webp');
     assert.equal(imeAndWebpResult.quotaCaughtCleanly, true, 'saveAccounts() must catch QuotaExceededError gracefully');
     await waitFor(() => hooks.getLayoutState().overlayBlocked === false);
 
-    // 9e. Window bounds & maximized state persistence in settings.json + real createWindow() restart restoration
+    // 9e. Window bounds & maximized state persistence in settings.json + Minimize-from-Maximized Windows regression check
     win.setBounds({ x: 140, y: 110, width: 1120, height: 720 });
     hooks.captureCurrentWindowState();
     hooks.saveMainSettingsSync();
@@ -867,7 +1059,9 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
     assert.ok(recreatedWin && !recreatedWin.isDestroyed(), 'Expected recreated BrowserWindow');
     const recreatedBounds = recreatedWin.getBounds();
     const liveDisplays = screen.getAllDisplays();
-    const expectedClamped = sanitizeWindowState(hooks.getMainSettings().windowState, liveDisplays, {
+    const primaryDisp = screen.getPrimaryDisplay();
+    const taggedDisplays = liveDisplays.map((d) => (primaryDisp && d.id === primaryDisp.id ? { ...d, isPrimary: true } : d));
+    const expectedClamped = sanitizeWindowState(hooks.getMainSettings().windowState, taggedDisplays, {
       width: 1280,
       height: 800,
       minWidth: 940,
@@ -875,14 +1069,31 @@ function waitFor(predicate, label = 'condition', timeoutMs = 8000, intervalMs = 
     });
     assert.equal(recreatedBounds.width, expectedClamped.width, 'Recreated BrowserWindow must restore saved width');
     assert.equal(recreatedBounds.height, expectedClamped.height, 'Recreated BrowserWindow must restore saved height');
-    if (liveDisplays.length > 0) {
-      const wa = liveDisplays[0].workArea;
-      assert.ok(recreatedBounds.x >= wa.x && recreatedBounds.x + recreatedBounds.width <= wa.x + wa.width, 'Recreated BrowserWindow x must be clamped onto active display');
-      assert.ok(recreatedBounds.y >= wa.y && recreatedBounds.y + recreatedBounds.height <= wa.y + wa.height, 'Recreated BrowserWindow y must be clamped onto active display');
+    if (primaryDisp && primaryDisp.workArea) {
+      const wa = primaryDisp.workArea;
+      assert.ok(recreatedBounds.x >= wa.x && recreatedBounds.x + recreatedBounds.width <= wa.x + wa.width, 'Recreated BrowserWindow x must be clamped onto primary display');
+      assert.ok(recreatedBounds.y >= wa.y && recreatedBounds.y + recreatedBounds.height <= wa.y + wa.height, 'Recreated BrowserWindow y must be clamped onto primary display');
     }
     // Even while started hidden before first show, capturing window state must preserve pending isMaximized=true!
     hooks.captureCurrentWindowState();
     assert.equal(hooks.getMainSettings().windowState.isMaximized, true, 'Deferred maximize state must not be clobbered while hidden');
+
+    // Show recreatedWin -> deferred maximize triggers -> then minimize() -> wait >300ms -> isMaximized MUST remain true on Windows!
+    recreatedWin.showInactive();
+    recreatedWin.maximize();
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(recreatedWin.isMaximized(), true);
+    recreatedWin.minimize();
+    await new Promise((r) => setTimeout(r, 320));
+    hooks.captureCurrentWindowState();
+    const afterMinimizeFromMax = hooks.getMainSettings().windowState;
+    assert.equal(
+      afterMinimizeFromMax.isMaximized,
+      true,
+      'Minimizing a maximized BrowserWindow on Windows must NOT clobber windowState.isMaximized to false'
+    );
+    assert.equal(afterMinimizeFromMax.width, expectedClamped.width, 'Pre-maximize normal width must be preserved via getNormalBounds()');
+    assert.equal(afterMinimizeFromMax.height, expectedClamped.height, 'Pre-maximize normal height must be preserved via getNormalBounds()');
 
     console.log('\n✅ ALL 9 ELECTRON 45 E2E INTEGRATION SUITES PASSED!');
 
