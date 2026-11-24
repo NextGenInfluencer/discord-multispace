@@ -1,3 +1,5 @@
+Set fso = CreateObject("Scripting.FileSystemObject")
 Set WshShell = CreateObject("WScript.Shell")
-WshShell.CurrentDirectory = "C:\Users\lefte\Documents\antigravity\discord-multispace"
-WshShell.Run """node_modules\electron\dist\electron.exe"" .", 0, False
+scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
+WshShell.CurrentDirectory = scriptDir
+WshShell.Run """" & scriptDir & "\node_modules\electron\dist\electron.exe"" """ & scriptDir & """", 0, False

@@ -4,7 +4,7 @@
  * silent desktop shortcut without leaving a terminal window open.
  */
 
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
@@ -18,38 +18,49 @@ try {
   electronExePath = path.join(projectDir, 'node_modules', 'electron', 'dist', 'electron.exe');
 }
 
-// Fallback check
-if (!fs.existsSync(electronExePath)) {
+if (!electronExePath || !fs.existsSync(electronExePath)) {
   electronExePath = path.join(projectDir, 'node_modules', 'electron', 'dist', 'electron.exe');
 }
+
+const iconFilePath = path.join(projectDir, 'assets', 'icon.ico');
+const iconLocation = fs.existsSync(iconFilePath) ? `${iconFilePath},0` : `${electronExePath},0`;
+
+function escapePsSingleQuoted(value) {
+  return String(value).replace(/'/g, "''");
+}
+
+// Escape embedded double quotes for Windows command-line argument string
+const quotedArg = `"${projectDir.replace(/"/g, '\\"')}"`;
 
 console.log('Project Directory:', projectDir);
 console.log('Electron Executable:', electronExePath);
 
-// PowerShell script to invoke WScript.Shell and create the .lnk shortcut
 const psCommand = `
+$ErrorActionPreference = 'Stop'
 $WshShell = New-Object -ComObject WScript.Shell
-$DesktopPath = $WshShell.SpecialFolders("Desktop")
-$ShortcutPath = Join-Path $DesktopPath "Discord MultiSpace.lnk"
+$DesktopPath = $WshShell.SpecialFolders('Desktop')
+$ShortcutPath = Join-Path $DesktopPath 'Discord MultiSpace.lnk'
 $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
-$Shortcut.TargetPath = '${electronExePath}'
-$Shortcut.Arguments = '"${projectDir}"'
-$Shortcut.WorkingDirectory = '${projectDir}'
-$Shortcut.IconLocation = '${electronExePath},0'
+$Shortcut.TargetPath = '${escapePsSingleQuoted(electronExePath)}'
+$Shortcut.Arguments = '${escapePsSingleQuoted(quotedArg)}'
+$Shortcut.WorkingDirectory = '${escapePsSingleQuoted(projectDir)}'
+$Shortcut.IconLocation = '${escapePsSingleQuoted(iconLocation)}'
 $Shortcut.Description = 'Discord MultiSpace - Multi-Account Desktop Client'
 $Shortcut.Save()
 Write-Output "SUCCESS: Shortcut created at $ShortcutPath"
 `.trim();
 
-// Base64 encode the PowerShell script to avoid escaping issues
 const psEncoded = Buffer.from(psCommand, 'utf16le').toString('base64');
-const command = `powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${psEncoded}`;
 
-exec(command, (error, stdout, stderr) => {
-  if (error) {
-    console.error('Failed to create shortcut:', error);
-    if (stderr) console.error(stderr);
-    process.exit(1);
+execFile(
+  'powershell.exe',
+  ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', psEncoded],
+  (error, stdout, stderr) => {
+    if (error) {
+      console.error('Failed to create shortcut:', error);
+      if (stderr) console.error(stderr);
+      process.exit(1);
+    }
+    console.log(stdout.trim());
   }
-  console.log(stdout.trim());
-});
+);

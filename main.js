@@ -1,32 +1,222 @@
-const { app, BrowserWindow, shell, session, Tray, Menu, nativeImage, ipcMain, globalShortcut, desktopCapturer, webContents } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  WebContentsView,
+  shell,
+  session,
+  Tray,
+  Menu,
+  nativeImage,
+  ipcMain,
+  globalShortcut,
+  desktopCapturer
+} = require('electron');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
-const { exec } = require('child_process');
 const { autoUpdater } = require('electron-updater');
+const {
+  isValidAccountId,
+  isValidPartition,
+  partitionForAccountId,
+  redactSensitiveUrl,
+  parseAndValidateProxy,
+  safeFetchThemeCss,
+  transformDiscordCspHeader,
+  isTrustedDiscordOrigin,
+  classifyNavigationUrl,
+  classifyPopupRequest,
+  matchAudioInputDevice,
+  computePaneBounds,
+  parseDiscordTitleUnread
+} = require('./lib/security');
 
 app.setName('Discord MultiSpace');
 
+const IS_TEST_MODE = process.env.MULTISPACE_TEST_MODE === '1' && !app.isPackaged;
+if (IS_TEST_MODE && process.env.MULTISPACE_TEST_USER_DATA) {
+  app.setPath('userData', process.env.MULTISPACE_TEST_USER_DATA);
+}
+const DISCORD_APP_URL = (IS_TEST_MODE && process.env.MULTISPACE_TEST_DISCORD_URL)
+  ? process.env.MULTISPACE_TEST_DISCORD_URL
+  : 'https://discord.com/app';
+const START_HIDDEN = process.argv.includes('--hidden');
+
 let tray = null;
 let mainWindow = null;
-let appState = {
+let hudView = null;
+let hudHideTimer = null;
+
+const appState = {
   accountCount: 1,
   activeAccountName: 'Account 1',
   unreadCount: 0
 };
 
-// Map to track active screen share requests: requestId -> { callback, sources, request }
+// Persistent main-process preferences (stored in userData/settings.json)
+let mainSettings = {
+  globalShortcutsEnabled: false,
+  streamAudioDeviceLabel: 'loopback'
+};
+
+// Account WebContentsViews: accountId -> entry
+const accountViews = new Map();
+
+// Session -> { username, password } for HTTP 407 proxy authentication
+const proxyAuthBySession = new WeakMap();
+// Bounded map to avoid infinite 407 auth retry loops on bad credentials
+const proxyAuthAttempts = new Map();
+
+// Layout & overlay state synced from renderer
+const layoutState = {
+  activeAccountId: null,
+  isSplitView: false,
+  splitPrimaryId: null,
+  splitSecondaryId: null,
+  containerRect: { x: 72, y: 0, width: 1208, height: 800 },
+  overlayBlocked: false
+};
+
+// Theme state
+let isCustomThemeActive = false;
+let currentResolvedThemeCss = '';
+
+// Boss key & global deafen state
+let isBossKeyMuted = false;
+const audioMuteStateBeforeBossKey = new Map();
+let globalDeafenedState = false;
+
+// Screen share state
 const pendingDisplayMediaRequests = new Map();
 let lastConfirmedDisplayMedia = null;
 let lastConfirmedTimestamp = 0;
-let currentStreamAudioDeviceLabel = 'loopback';
 
+// Updater state
+let lastUpdateCheckManual = false;
+
+// ============================================================================
+// Non-Blocking Async Rotating Logger
+// ============================================================================
+const MAX_LOG_BYTES = 2 * 1024 * 1024; // 2 MB
+let logFile;
+try {
+  logFile = path.join(app.getPath('userData'), 'app.log');
+} catch {
+  logFile = path.join(__dirname, 'app.log');
+}
+
+let logQueue = Promise.resolve();
+let logBytesApprox = 0;
+try {
+  if (fs.existsSync(logFile)) {
+    logBytesApprox = fs.statSync(logFile).size;
+  }
+} catch {}
+
+function log(msg) {
+  const safeMsg = redactSensitiveUrl(String(msg));
+  const line = `[${new Date().toISOString()}] ${safeMsg}\n`;
+  logQueue = logQueue
+    .then(async () => {
+      try {
+        if (logBytesApprox > MAX_LOG_BYTES) {
+          try {
+            await fs.promises.rename(logFile, `${logFile}.1`);
+          } catch {}
+          logBytesApprox = 0;
+        }
+        await fs.promises.appendFile(logFile, line, 'utf8');
+        logBytesApprox += Buffer.byteLength(line, 'utf8');
+      } catch {}
+    })
+    .catch(() => {});
+}
+
+log(`\n--- App Starting --- PID: ${process.pid}`);
+log(`argv: ${JSON.stringify(process.argv.map((a) => redactSensitiveUrl(a)))}`);
+
+process.on('uncaughtException', (err) => {
+  log(`UNCAUGHT EXCEPTION: ${(err && err.stack) || err}`);
+});
+
+process.on('unhandledRejection', (reason) => {
+  log(`UNHANDLED REJECTION: ${reason}`);
+});
+
+// ============================================================================
+// Main Settings Persistence
+// ============================================================================
+function getSettingsFilePath() {
+  return path.join(app.getPath('userData'), 'settings.json');
+}
+
+function loadMainSettings() {
+  try {
+    const file = getSettingsFilePath();
+    if (fs.existsSync(file)) {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (parsed && typeof parsed === 'object') {
+        mainSettings = {
+          globalShortcutsEnabled: Boolean(parsed.globalShortcutsEnabled),
+          streamAudioDeviceLabel: typeof parsed.streamAudioDeviceLabel === 'string' && parsed.streamAudioDeviceLabel
+            ? parsed.streamAudioDeviceLabel
+            : 'loopback'
+        };
+      }
+    }
+  } catch (err) {
+    log(`Failed to read settings.json: ${err}`);
+  }
+}
+
+async function saveMainSettings() {
+  try {
+    await fs.promises.writeFile(getSettingsFilePath(), JSON.stringify(mainSettings, null, 2), 'utf8');
+  } catch (err) {
+    log(`Failed to save settings.json: ${err}`);
+  }
+}
+
+// ============================================================================
+// User-Agent & Chromium Switches
+// ============================================================================
+function buildChromeUserAgent() {
+  const base = app.userAgentFallback || '';
+  return base.replace(/\s*Electron\/\S+/i, '').replace(/\s{2,}/g, ' ').trim();
+}
+const CHROME_USER_AGENT = buildChromeUserAgent();
+app.userAgentFallback = CHROME_USER_AGENT;
+
+// Safe Chromium switches (SharedArrayBuffer intentionally NOT enabled globally)
+app.commandLine.appendSwitch('disable-features', 'HardwareMediaKeyHandling');
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
+// ============================================================================
+// IPC Sender Validation
+// ============================================================================
+function isTrustedSender(event) {
+  return Boolean(
+    event &&
+    mainWindow &&
+    !mainWindow.isDestroyed() &&
+    event.sender === mainWindow.webContents
+  );
+}
+
+function sendToRenderer(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send(channel, payload);
+  }
+}
+
+// ============================================================================
+// Screen-Share Display Media Request Handler
+// ============================================================================
 async function handleDisplayMediaRequest(request, callback) {
   try {
-    const requestId = 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-    log(`Handling display media request [${requestId}] from origin: ${request.securityOrigin || 'unknown'} (videoRequested: ${request.videoRequested}, audioRequested: ${request.audioRequested})`);
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    log(`Handling display media request [${requestId}] from origin: ${request.securityOrigin || 'unknown'}`);
 
-    // Fetch available screens and windows with preview thumbnails
     const sources = await desktopCapturer.getSources({
       types: ['screen', 'window'],
       fetchWindowIcons: true,
@@ -34,27 +224,30 @@ async function handleDisplayMediaRequest(request, callback) {
     });
 
     if (!sources || sources.length === 0) {
-      log(`No display sources found for request [${requestId}]`);
       callback({});
       return;
     }
 
-    // Deduplication / Debounce: Discord web frequently issues two rapid getDisplayMedia requests
-    // (e.g. video probe followed by active stream). Auto-fulfill if confirmed within 2 seconds.
+    // Deduplicate Discord's rapid secondary getDisplayMedia probe within 2s —
+    // NEVER fall back to sources[0] (primary monitor) if the chosen window closed!
     const now = Date.now();
     if (lastConfirmedDisplayMedia && (now - lastConfirmedTimestamp) < 2000) {
-      const matchingSource = sources.find((s) => s.id === lastConfirmedDisplayMedia.sourceId) || sources[0];
+      const matchingSource = sources.find((s) => s.id === lastConfirmedDisplayMedia.sourceId);
       if (matchingSource) {
-        log(`Auto-fulfilling secondary display media request [${requestId}] with last source [${matchingSource.id}] "${matchingSource.name}"`);
+        log(`Auto-fulfilling secondary display media request [${requestId}] with confirmed source [${matchingSource.id}]`);
         callback({
           video: matchingSource,
           audio: lastConfirmedDisplayMedia.withAudio ? 'loopback' : undefined
         });
         return;
       }
+      // Selected window disappeared; invalidate cache and abort rather than leaking full screen
+      lastConfirmedDisplayMedia = null;
+      lastConfirmedTimestamp = 0;
+      callback({});
+      return;
     }
 
-    // Cancel any previous pending requests cleanly
     for (const [oldId, oldReq] of pendingDisplayMediaRequests.entries()) {
       try {
         oldReq.callback({});
@@ -62,28 +255,18 @@ async function handleDisplayMediaRequest(request, callback) {
       pendingDisplayMediaRequests.delete(oldId);
     }
 
-    // Save pending request
     pendingDisplayMediaRequests.set(requestId, { callback, sources, request });
 
-    // Filter out blank-titled windows and format sources for renderer
     const serializedSources = sources
-      .filter((s) => {
-        if (s.id.startsWith('screen:')) return true;
-        if (!s.name || s.name.trim() === '') return false;
-        return true;
-      })
+      .filter((s) => s.id.startsWith('screen:') || (s.name && s.name.trim() !== ''))
       .map((s) => {
         let thumb = '';
         let icon = '';
         try {
-          if (s.thumbnail && !s.thumbnail.isEmpty()) {
-            thumb = s.thumbnail.toDataURL();
-          }
+          if (s.thumbnail && !s.thumbnail.isEmpty()) thumb = s.thumbnail.toDataURL();
         } catch {}
         try {
-          if (s.appIcon && !s.appIcon.isEmpty()) {
-            icon = s.appIcon.toDataURL();
-          }
+          if (s.appIcon && !s.appIcon.isEmpty()) icon = s.appIcon.toDataURL();
         } catch {}
         return {
           id: s.id,
@@ -99,61 +282,68 @@ async function handleDisplayMediaRequest(request, callback) {
         mainWindow.show();
       }
       mainWindow.focus();
-      mainWindow.webContents.send('open-screen-picker', { requestId, sources: serializedSources });
+      sendToRenderer('open-screen-picker', { requestId, sources: serializedSources });
     } else {
       callback({});
       pendingDisplayMediaRequests.delete(requestId);
     }
   } catch (err) {
-    log(`Display media request handler error: ${err.stack || err}`);
+    log(`Display media request handler error: ${(err && err.stack) || err}`);
     try {
       callback({});
     } catch {}
   }
 }
 
-// Log file is written to userData dir so it works in ASAR-packed production builds
-let logFile;
-try {
-  logFile = path.join(app.getPath('userData'), 'app.log');
-} catch {
-  logFile = path.join(__dirname, 'app.log');
+// ============================================================================
+// Session Security, CSP & Permission Configuration
+// ============================================================================
+const DISCORD_ALLOWED_PERMISSIONS = new Set([
+  'media',
+  'mediaKeySystem',
+  'audioCapture',
+  'videoCapture',
+  'notifications',
+  'microphone',
+  'camera',
+  'clipboard-sanitized-write',
+  'display-capture',
+  'speaker-selection',
+  'fullscreen'
+]);
+
+const SHELL_ALLOWED_PERMISSIONS = new Set([
+  'media',
+  'audioCapture'
+]);
+
+function checkOriginPermission(wc, permission, requestingUrl) {
+  // Never auto-grant clipboard-read to any frame
+  if (permission === 'clipboard-read' || permission === 'deprecated-sync-clipboard-read') {
+    return false;
+  }
+
+  // Allow shell index.html to enumerate audio input labels for Settings / Screen Picker
+  if (mainWindow && !mainWindow.isDestroyed() && wc === mainWindow.webContents) {
+    const url = requestingUrl || (wc && !wc.isDestroyed() ? wc.getURL() : '');
+    if (url.startsWith('file://')) {
+      return SHELL_ALLOWED_PERMISSIONS.has(permission);
+    }
+    return false;
+  }
+
+  const candidateUrl = requestingUrl || (wc && !wc.isDestroyed() ? wc.getURL() : '');
+  if (IS_TEST_MODE && candidateUrl && candidateUrl.startsWith(DISCORD_APP_URL.split('/app')[0])) {
+    return DISCORD_ALLOWED_PERMISSIONS.has(permission);
+  }
+
+  if (!isTrustedDiscordOrigin(candidateUrl)) {
+    return false;
+  }
+
+  return DISCORD_ALLOWED_PERMISSIONS.has(permission);
 }
-function log(msg) {
-  try {
-    fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${msg}\n`);
-  } catch {}
-}
 
-log(`\n--- App Starting --- PID: ${process.pid}`);
-log(`argv: ${JSON.stringify(process.argv)}`);
-log(`cwd: ${process.cwd()}`);
-
-process.on('uncaughtException', (err) => {
-  log(`UNCAUGHT EXCEPTION: ${err.stack || err}`);
-});
-
-process.on('unhandledRejection', (reason) => {
-  log(`UNHANDLED REJECTION: ${reason}`);
-});
-
-// Derive a clean Chrome user agent from Electron's default, stripping the Electron/ token
-function buildChromeUserAgent() {
-  const base = app.userAgentFallback || '';
-  return base.replace(/\s*Electron\/\S+/i, '').replace(/\s{2,}/g, ' ').trim();
-}
-const CHROME_USER_AGENT = buildChromeUserAgent();
-app.userAgentFallback = CHROME_USER_AGENT;
-
-// Chromium Audio, Hardware & WebRTC Optimization Switches
-app.commandLine.appendSwitch('disable-features', 'HardwareMediaKeyHandling');
-app.commandLine.appendSwitch('enable-features', 'SharedArrayBuffer');
-app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
-
-/**
- * Configure permissions, screen sharing, and headers for a given session.
- * Ensures microphone/camera/screen sharing access works for Discord voice/video calls.
- */
 function setupSession(targetSession) {
   if (!targetSession || targetSession._isConfiguredForDiscord) return;
   targetSession._isConfiguredForDiscord = true;
@@ -168,23 +358,23 @@ function setupSession(targetSession) {
     }
   }
 
-  // Relax CSP headers on Discord pages to allow community themes & external fonts/stylesheets
+  // Conditional CSP relaxation: 100% untouched on Default/Minimalist, never modifies connect-src
   if (targetSession.webRequest && typeof targetSession.webRequest.onHeadersReceived === 'function') {
     try {
       targetSession.webRequest.onHeadersReceived(
         { urls: ['https://discord.com/*', 'https://*.discord.com/*', 'https://*.discordapp.com/*'] },
         (details, callback) => {
+          if (!isCustomThemeActive || !details.responseHeaders) {
+            callback({ responseHeaders: details.responseHeaders });
+            return;
+          }
           const responseHeaders = Object.assign({}, details.responseHeaders);
           for (const headerKey of Object.keys(responseHeaders)) {
             const lower = headerKey.toLowerCase();
             if (lower === 'content-security-policy' || lower === 'content-security-policy-report-only') {
-              responseHeaders[headerKey] = responseHeaders[headerKey].map((csp) => {
-                return csp
-                  .replace(/style-src\s+([^;]+)/gi, "style-src * 'unsafe-inline' blob: data:")
-                  .replace(/font-src\s+([^;]+)/gi, "font-src * blob: data:")
-                  .replace(/img-src\s+([^;]+)/gi, "img-src * blob: data:")
-                  .replace(/connect-src\s+([^;]+)/gi, "connect-src * blob: data:");
-              });
+              responseHeaders[headerKey] = responseHeaders[headerKey].map((csp) =>
+                transformDiscordCspHeader(csp, true)
+              );
             }
           }
           callback({ responseHeaders });
@@ -195,51 +385,975 @@ function setupSession(targetSession) {
     }
   }
 
-  // WebRTC Screen & Game Sharing Engine — captures screens/windows with system audio loopback
   if (typeof targetSession.setDisplayMediaRequestHandler === 'function') {
     targetSession.setDisplayMediaRequestHandler((request, callback) => {
       handleDisplayMediaRequest(request, callback);
     });
   }
 
-  targetSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    const allowedPermissions = [
-      'media',
-      'mediaKeySystem',
-      'audioCapture',
-      'videoCapture',
-      'notifications',
-      'microphone',
-      'camera',
-      'clipboard-read',
-      'clipboard-sanitized-write',
-      'display-capture',
-      'speaker-selection'
-    ];
-    if (allowedPermissions.includes(permission)) {
-      callback(true);
-    } else {
-      callback(false);
-    }
+  targetSession.setPermissionRequestHandler((wc, permission, callback, details) => {
+    const reqUrl = (details && details.requestingUrl) || '';
+    callback(checkOriginPermission(wc, permission, reqUrl));
   });
 
-  targetSession.setPermissionCheckHandler((webContents, permission) => {
-    const allowedPermissions = [
-      'media',
-      'mediaKeySystem',
-      'audioCapture',
-      'videoCapture',
-      'notifications',
-      'microphone',
-      'camera',
-      'display-capture',
-      'speaker-selection'
-    ];
-    return allowedPermissions.includes(permission);
+  targetSession.setPermissionCheckHandler((wc, permission, requestingOrigin, details) => {
+    const reqUrl = (details && details.requestingUrl) || requestingOrigin || '';
+    return checkOriginPermission(wc, permission, reqUrl);
   });
 }
 
+// Register top-level app lifecycle listeners ONCE (never inside createWindow)
+app.on('session-created', (newSession) => {
+  setupSession(newSession);
+});
+
+// HTTP 407 Proxy Authentication Handler
+app.on('login', (event, wc, authenticationResponseDetails, authInfo, callback) => {
+  if (!authInfo || !authInfo.isProxy || !wc || wc.isDestroyed()) {
+    return;
+  }
+
+  const creds = proxyAuthBySession.get(wc.session);
+  if (!creds) {
+    return;
+  }
+
+  const key = `${wc.session ? 'ses' : 'none'}:${(authenticationResponseDetails && authenticationResponseDetails.url) || ''}:${authInfo.host}:${authInfo.port}`;
+  const attempts = (proxyAuthAttempts.get(key) || 0) + 1;
+  if (proxyAuthAttempts.size > 500) {
+    proxyAuthAttempts.clear();
+  }
+  proxyAuthAttempts.set(key, attempts);
+
+  if (attempts > 2) {
+    log(`Proxy authentication failed after ${attempts - 1} attempts for ${authInfo.host}:${authInfo.port}`);
+    proxyAuthAttempts.delete(key);
+    callback();
+    return;
+  }
+
+  event.preventDefault();
+  callback(creds.username, creds.password);
+});
+
+app.on('web-contents-created', (_event, contents) => {
+  if (contents.session) {
+    setupSession(contents.session);
+  }
+
+  // Block any legacy <webview> attachment completely
+  contents.on('will-attach-webview', (event) => {
+    event.preventDefault();
+  });
+});
+
+// ============================================================================
+// Screen-Share Custom Audio Patch (Injected into Discord Account Views)
+// ============================================================================
+const DISCORD_MEDIA_AUDIO_PATCH = `
+(() => {
+  try {
+    if (window.__discordMultiSpaceAudioPatched) return;
+    window.__discordMultiSpaceAudioPatched = true;
+    if (typeof window.__discordMultiSpaceShareAudio !== 'boolean') {
+      window.__discordMultiSpaceShareAudio = true;
+    }
+
+    const matchAudioInputDevice = ${matchAudioInputDevice.toString()};
+
+    if (navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function') {
+      const originalGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
+      navigator.mediaDevices.getDisplayMedia = async function(constraints) {
+        const safe = (typeof constraints === 'object' && constraints !== null)
+          ? Object.assign({}, constraints)
+          : { video: true };
+
+        if (!safe.audio || typeof safe.audio !== 'object') {
+          safe.audio = {
+            autoGainControl: false,
+            echoCancellation: false,
+            noiseSuppression: false,
+            systemAudio: 'include'
+          };
+        } else {
+          safe.audio = Object.assign({}, safe.audio, {
+            autoGainControl: false,
+            echoCancellation: false,
+            noiseSuppression: false,
+            systemAudio: 'include'
+          });
+        }
+
+        const stream = await originalGetDisplayMedia(safe);
+
+        // Respect unchecked "Share Audio" — never capture custom mic/cable if user unchecked audio!
+        if (window.__discordMultiSpaceShareAudio === false) {
+          stream.getAudioTracks().forEach((t) => {
+            try {
+              stream.removeTrack(t);
+              t.stop();
+            } catch {}
+          });
+          return stream;
+        }
+
+        const targetLabel = (window.__discordMultiSpaceAudioDeviceLabel || 'loopback').trim();
+        if (targetLabel && targetLabel !== 'loopback' && navigator.mediaDevices.getUserMedia) {
+          try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const matched = matchAudioInputDevice(devices, targetLabel);
+
+            if (matched && matched.deviceId) {
+              const customStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                  deviceId: { exact: matched.deviceId },
+                  autoGainControl: false,
+                  echoCancellation: false,
+                  noiseSuppression: false,
+                  channelCount: 2
+                }
+              });
+              const customTrack = customStream.getAudioTracks()[0];
+              if (customTrack) {
+                customTrack.enabled = true;
+                if ('contentHint' in customTrack) {
+                  try { customTrack.contentHint = 'music'; } catch {}
+                }
+                stream.getAudioTracks().forEach((t) => {
+                  try {
+                    stream.removeTrack(t);
+                    t.stop();
+                  } catch {}
+                });
+                stream.addTrack(customTrack);
+
+                // Stop custom audio capture handle when video stream ends OR when Discord stops video track
+                let cleanedUp = false;
+                const stopCustomAudio = () => {
+                  if (cleanedUp) return;
+                  cleanedUp = true;
+                  try { customTrack.stop(); } catch {}
+                };
+                const videoTrack = stream.getVideoTracks()[0];
+                if (videoTrack) {
+                  videoTrack.addEventListener('ended', stopCustomAudio, { once: true });
+                  const origStop = videoTrack.stop.bind(videoTrack);
+                  videoTrack.stop = function(...args) {
+                    stopCustomAudio();
+                    return origStop(...args);
+                  };
+                }
+              }
+            }
+          } catch (err) {
+            console.warn('[MultiSpace] Custom audio track injection failed, retaining default loopback:', err);
+          }
+        } else {
+          stream.getAudioTracks().forEach((track) => {
+            track.enabled = true;
+            if ('contentHint' in track) {
+              try { track.contentHint = 'music'; } catch {}
+            }
+          });
+        }
+
+        return stream;
+      };
+    }
+  } catch {}
+})();
+`;
+
+function broadcastAudioDeviceLabelToViews(label) {
+  mainSettings.streamAudioDeviceLabel = label || 'loopback';
+  saveMainSettings();
+  const payload = JSON.stringify(mainSettings.streamAudioDeviceLabel);
+  for (const entry of accountViews.values()) {
+    const wc = entry.view.webContents;
+    if (!wc.isDestroyed()) {
+      wc.executeJavaScript(`window.__discordMultiSpaceAudioDeviceLabel = ${payload};`).catch(() => {});
+    }
+  }
+}
+
+// ============================================================================
+// Proxy Session Configuration (Fail-Closed & Awaited Before Any Load)
+// ============================================================================
+async function configureAccountSessionProxy(accountId, rawProxy) {
+  const partition = partitionForAccountId(accountId);
+  const targetSession = session.fromPartition(partition);
+  setupSession(targetSession);
+
+  const parsed = parseAndValidateProxy(rawProxy);
+  if (!parsed.valid) {
+    // Fail-closed: bind invalid proxy to dead loopback port 1 so traffic NEVER leaks over DIRECT
+    proxyAuthBySession.delete(targetSession);
+    await targetSession.setProxy({
+      proxyRules: 'http://127.0.0.1:1',
+      proxyBypassRules: '<-loopback>'
+    });
+    await targetSession.closeAllConnections();
+    log(`Blocked invalid proxy for [${partition}]: ${parsed.error}`);
+    return { ok: false, hasProxy: true, error: parsed.error };
+  }
+
+  if (parsed.mode === 'direct') {
+    proxyAuthBySession.delete(targetSession);
+    await targetSession.setProxy({ proxyRules: '' });
+    await targetSession.closeAllConnections();
+    if (typeof targetSession.forceReloadProxyConfig === 'function') {
+      await targetSession.forceReloadProxyConfig();
+    }
+    log(`Proxy cleared (DIRECT) for partition [${partition}]`);
+    return { ok: true, hasProxy: false };
+  }
+
+  if (parsed.auth) {
+    proxyAuthBySession.set(targetSession, parsed.auth);
+  } else {
+    proxyAuthBySession.delete(targetSession);
+  }
+
+  await targetSession.setProxy({
+    proxyRules: parsed.proxyRules,
+    proxyBypassRules: '<-loopback>'
+  });
+  await targetSession.closeAllConnections();
+  if (typeof targetSession.forceReloadProxyConfig === 'function') {
+    await targetSession.forceReloadProxyConfig();
+  }
+  log(`Proxy configured for partition [${partition}]: ${parsed.redacted}`);
+  return { ok: true, hasProxy: true, redacted: parsed.redacted };
+}
+
+// ============================================================================
+// Floating HUD View (Tooltips, Toasts, Zoom Pill Above Native WebContentsViews)
+// ============================================================================
+const HUD_HTML = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    user-select: none;
+  }
+  #root {
+    width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .hud-pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: #111214;
+    color: #f2f3f5;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 13px; font-weight: 600;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.55);
+    white-space: nowrap;
+    max-width: 100%;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .hud-shortcut {
+    font-size: 11px; font-weight: 700;
+    color: #949ba4;
+    background: rgba(255,255,255,0.08);
+    padding: 2px 6px; border-radius: 4px;
+  }
+  .dot-ok { width: 8px; height: 8px; border-radius: 50%; background: #23a55a; flex-shrink: 0; }
+  .dot-err { width: 8px; height: 8px; border-radius: 50%; background: #f23f43; flex-shrink: 0; }
+</style>
+</head>
+<body><div id="root"></div></body>
+</html>`;
+
+function createHudView() {
+  if (!mainWindow || mainWindow.isDestroyed() || hudView) return;
+  hudView = new WebContentsView({
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true
+    }
+  });
+  hudView.setBackgroundColor('#00000000');
+  hudView.setVisible(false);
+  hudView.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+  mainWindow.contentView.addChildView(hudView);
+  hudView.webContents.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(HUD_HTML)}`).catch(() => {});
+}
+
+function hideHudView() {
+  clearTimeout(hudHideTimer);
+  hudHideTimer = null;
+  if (hudView && !hudView.webContents.isDestroyed()) {
+    hudView.setVisible(false);
+    hudView.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+  }
+}
+
+function showHudCard({ x, y, width, height, htmlPayload, autoHideMs = 0 }) {
+  if (!hudView || hudView.webContents.isDestroyed() || !mainWindow || mainWindow.isDestroyed()) return;
+  if (layoutState.overlayBlocked) return;
+
+  clearTimeout(hudHideTimer);
+  // Ensure hudView is topmost child
+  mainWindow.contentView.addChildView(hudView);
+  hudView.setBounds({
+    x: Math.max(0, Math.round(x)),
+    y: Math.max(0, Math.round(y)),
+    width: Math.max(0, Math.round(width)),
+    height: Math.max(0, Math.round(height))
+  });
+  hudView.setVisible(true);
+  hudView.webContents.executeJavaScript(`
+    (() => {
+      const r = document.getElementById('root');
+      if (r) r.innerHTML = ${JSON.stringify(htmlPayload)};
+    })();
+  `).catch(() => {});
+
+  if (autoHideMs > 0) {
+    hudHideTimer = setTimeout(() => {
+      hideHudView();
+    }, autoHideMs);
+  }
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// ============================================================================
+// WebContentsView Management, Theme Injection & Bounds Layout
+// ============================================================================
+async function applyThemeToEntry(entry) {
+  if (!entry || !entry.view || entry.view.webContents.isDestroyed()) return;
+  const wc = entry.view.webContents;
+  try {
+    if (entry.insertedCssKey) {
+      await wc.removeInsertedCSS(entry.insertedCssKey).catch(() => {});
+      entry.insertedCssKey = null;
+    }
+    if (currentResolvedThemeCss && currentResolvedThemeCss.trim()) {
+      entry.insertedCssKey = await wc.insertCSS(currentResolvedThemeCss);
+    }
+  } catch {}
+}
+
+function attachContextMenu(wc) {
+  wc.on('context-menu', (_event, params) => {
+    const hasSuggestions = params.dictionarySuggestions && params.dictionarySuggestions.length > 0;
+    const isEditable = params.isEditable;
+    const hasSelection = params.selectionText && params.selectionText.trim().length > 0;
+
+    if (!hasSuggestions && !isEditable && !hasSelection) return;
+
+    const menuTemplate = [];
+    if (hasSuggestions) {
+      params.dictionarySuggestions.forEach((suggestion) => {
+        menuTemplate.push({
+          label: suggestion,
+          click: () => wc.replaceMisspelling(suggestion)
+        });
+      });
+      if (params.misspelledWord) {
+        menuTemplate.push({
+          label: `Add "${params.misspelledWord}" to Dictionary`,
+          click: () => {
+            try {
+              wc.session.addWordToSpellCheckerDictionary(params.misspelledWord);
+            } catch {}
+          }
+        });
+      }
+      menuTemplate.push({ type: 'separator' });
+    }
+
+    if (isEditable) {
+      menuTemplate.push(
+        { role: 'undo', enabled: params.editFlags.canUndo },
+        { role: 'redo', enabled: params.editFlags.canRedo },
+        { type: 'separator' },
+        { role: 'cut', enabled: params.editFlags.canCut },
+        { role: 'copy', enabled: params.editFlags.canCopy },
+        { role: 'paste', enabled: params.editFlags.canPaste },
+        { role: 'selectAll', enabled: params.editFlags.canSelectAll }
+      );
+    } else if (hasSelection) {
+      menuTemplate.push(
+        { role: 'copy', enabled: params.editFlags.canCopy },
+        { role: 'selectAll', enabled: params.editFlags.canSelectAll }
+      );
+    }
+
+    if (menuTemplate.length > 0 && mainWindow && !mainWindow.isDestroyed()) {
+      const menu = Menu.buildFromTemplate(menuTemplate);
+      menu.popup({ window: mainWindow });
+    }
+  });
+}
+
+function adjustEntryZoom(entry, delta, reset = false) {
+  if (!entry || entry.view.webContents.isDestroyed()) return;
+  const next = reset
+    ? 1.0
+    : Math.min(2.0, Math.max(0.5, Math.round((entry.zoomFactor + delta) * 10) / 10));
+  entry.zoomFactor = next;
+  try {
+    entry.view.webContents.setZoomFactor(next);
+  } catch {}
+  sendToRenderer('view:zoom-changed', { accountId: entry.id, zoomFactor: next });
+}
+
+function attachNavigationAndShortcutHandlers(entry) {
+  const wc = entry.view.webContents;
+
+  // Keyboard shortcuts work seamlessly even when Discord WebContentsView has focus
+  wc.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return;
+    const ctrlOrMeta = input.control || input.meta;
+
+    // Reload App Shell: Ctrl+Shift+R or Shift+F5
+    if (input.shift && (input.key === 'F5' || (ctrlOrMeta && input.key.toLowerCase() === 'r'))) {
+      event.preventDefault();
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.reload();
+      return;
+    }
+
+    // Reload Active Discord View: F5 or Ctrl+R
+    if (input.key === 'F5' || (ctrlOrMeta && !input.shift && !input.alt && input.key.toLowerCase() === 'r')) {
+      event.preventDefault();
+      reloadAccountView(entry.id, false);
+      return;
+    }
+
+    // Switch Accounts: Ctrl+1..9
+    if (ctrlOrMeta && !input.alt && !input.shift && input.key >= '1' && input.key <= '9') {
+      event.preventDefault();
+      sendToRenderer('shortcut:switch-account-index', parseInt(input.key, 10) - 1);
+      return;
+    }
+
+    // Cycle Accounts: Ctrl+Tab / Ctrl+Shift+Tab
+    if (ctrlOrMeta && !input.alt && input.key === 'Tab') {
+      event.preventDefault();
+      sendToRenderer('shortcut:cycle-account', { reverse: Boolean(input.shift) });
+      return;
+    }
+
+    // Per-pane Zoom: Ctrl + / - / 0
+    if (ctrlOrMeta && !input.alt) {
+      if (input.key === '+' || input.key === '=' || input.key === 'Add') {
+        event.preventDefault();
+        adjustEntryZoom(entry, 0.1, false);
+      } else if (input.key === '-' || input.key === '_' || input.key === 'Subtract') {
+        event.preventDefault();
+        adjustEntryZoom(entry, -0.1, false);
+      } else if (input.key === '0' || input.key === 'NumPad0') {
+        event.preventDefault();
+        adjustEntryZoom(entry, 0, true);
+      }
+    }
+  });
+
+  const handleNavGuard = (details) => {
+    if (details.isMainFrame === false) return;
+    const targetUrl = details.url || '';
+    if (IS_TEST_MODE && targetUrl.startsWith(DISCORD_APP_URL.split('/app')[0])) {
+      return;
+    }
+    const decision = classifyNavigationUrl(targetUrl);
+    if (!decision.allow) {
+      details.preventDefault();
+      if (decision.openExternal) {
+        shell.openExternal(targetUrl).catch(() => {});
+      }
+    }
+  };
+
+  wc.on('will-navigate', handleNavGuard);
+  wc.on('will-redirect', handleNavGuard);
+
+  // Support Discord Voice/Stream Pop-Out windows (about:blank) and isolated OAuth2 popups
+  wc.setWindowOpenHandler((details) => {
+    const decision = classifyPopupRequest(details);
+    if (decision.action === 'allow-popout') {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 960,
+          height: 640,
+          autoHideMenuBar: true,
+          backgroundColor: '#1e1f22',
+          webPreferences: {
+            partition: entry.partition,
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: true,
+            webviewTag: false
+          }
+        }
+      };
+    }
+    if (decision.action === 'allow-oauth') {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 540,
+          height: 720,
+          autoHideMenuBar: true,
+          backgroundColor: '#1e1f22',
+          webPreferences: {
+            partition: entry.partition,
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: true,
+            webviewTag: false
+          }
+        }
+      };
+    }
+    if (decision.action === 'external' && decision.url) {
+      shell.openExternal(decision.url).catch(() => {});
+    }
+    return { action: 'deny' };
+  });
+
+  // Ensure any child window (popout / OAuth) has safe navigation guards
+  wc.on('did-create-window', (childWin, createDetails) => {
+    const isOAuth = classifyPopupRequest(createDetails).action === 'allow-oauth';
+    childWin.webContents.setWindowOpenHandler(({ url }) => {
+      if (typeof url === 'string' && (url.startsWith('https://') || url.startsWith('http://'))) {
+        shell.openExternal(url).catch(() => {});
+      }
+      return { action: 'deny' };
+    });
+    childWin.webContents.on('will-navigate', (navDetails) => {
+      if (navDetails.isMainFrame === false) return;
+      const u = navDetails.url || '';
+      if (isOAuth) {
+        // OAuth flows redirect across HTTPS identity providers (Spotify, GitHub, etc.) back to discord.com
+        if (!u.startsWith('https://')) {
+          navDetails.preventDefault();
+        }
+        return;
+      }
+      const dec = classifyNavigationUrl(u);
+      if (!dec.allow && u !== 'about:blank') {
+        navDetails.preventDefault();
+        if (dec.openExternal) shell.openExternal(u).catch(() => {});
+      }
+    });
+  });
+
+  attachContextMenu(wc);
+}
+
+async function pollViewNotifications(entry) {
+  if (!entry || entry.isHibernated || entry.view.webContents.isDestroyed()) return;
+  const wc = entry.view.webContents;
+  try {
+    const title = wc.getTitle();
+    const fromTitle = parseDiscordTitleUnread(title);
+    if (fromTitle !== null) {
+      sendToRenderer('view:notification-updated', { accountId: entry.id, badge: fromTitle });
+      return;
+    }
+
+    // Reachable DOM badge fallback when document.title does not encode unread counts
+    const domRes = await wc.executeJavaScript(`
+      (() => {
+        try {
+          const title = document.title || '';
+          const m = title.match(/^\\(([^)]+)\\)/);
+          if (m && m[1]) return m[1];
+          if (title.includes('•') || title.startsWith('(*)')) return '•';
+
+          const badges = document.querySelectorAll('[class*="numberBadge"], [class*="unreadMentionsIndicator"]');
+          let total = 0;
+          badges.forEach((b) => {
+            const n = parseInt(b.textContent, 10);
+            if (!Number.isNaN(n) && n > 0) total += n;
+          });
+          if (total > 0) return total > 99 ? '99+' : String(total);
+          if (document.querySelector('[class*="unread_"]')) return '•';
+          return 0;
+        } catch {
+          return 0;
+        }
+      })()
+    `);
+
+    if (typeof domRes === 'string' || typeof domRes === 'number') {
+      sendToRenderer('view:notification-updated', { accountId: entry.id, badge: domRes || null });
+    }
+  } catch {}
+}
+
+setInterval(() => {
+  for (const entry of accountViews.values()) {
+    pollViewNotifications(entry);
+  }
+}, 10000);
+
+async function ensureAccountView(account) {
+  const accountId = account.id;
+  if (!isValidAccountId(accountId)) {
+    return { ok: false, error: 'Invalid account ID.' };
+  }
+
+  let entry = accountViews.get(accountId);
+  const proxyResult = await configureAccountSessionProxy(accountId, account.proxy || '');
+
+  if (!entry || entry.view.webContents.isDestroyed()) {
+    const partition = partitionForAccountId(accountId);
+    const view = new WebContentsView({
+      webPreferences: {
+        partition,
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        webviewTag: false,
+        spellcheck: true,
+        backgroundThrottling: true
+      }
+    });
+    view.setBackgroundColor('#313338');
+    view.setVisible(false);
+    view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+
+    const wc = view.webContents;
+    wc.setWebRTCIPHandlingPolicy(proxyResult.hasProxy ? 'disable_non_proxied_udp' : 'default');
+
+    const initialZoom = typeof account.zoom === 'number'
+      ? Math.min(2.0, Math.max(0.5, account.zoom))
+      : 1.0;
+
+    entry = {
+      id: accountId,
+      partition,
+      view,
+      zoomFactor: initialZoom,
+      hasError: false,
+      pendingMainLoadFailed: false,
+      isLoading: false,
+      insertedCssKey: null,
+      hibernationCssKey: null,
+      isHibernated: false,
+      hasProxy: proxyResult.hasProxy
+    };
+    accountViews.set(accountId, entry);
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.contentView.addChildView(view);
+    }
+
+    const injectBridges = () => {
+      if (wc.isDestroyed()) return;
+      wc.executeJavaScript(DISCORD_MEDIA_AUDIO_PATCH).catch(() => {});
+      wc.executeJavaScript(
+        `window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`
+      ).catch(() => {});
+    };
+
+    wc.on('did-start-loading', () => {
+      entry.isLoading = true;
+      sendToRenderer('view:loading-state', { accountId, isLoading: true });
+    });
+
+    wc.on('did-stop-loading', () => {
+      entry.isLoading = false;
+      sendToRenderer('view:loading-state', { accountId, isLoading: false });
+    });
+
+    wc.on('did-start-navigation', (details) => {
+      if (details.isMainFrame && details.url && !details.url.startsWith('chrome-error:')) {
+        entry.pendingMainLoadFailed = false;
+      }
+    });
+
+    wc.on('did-fail-load', (_event, errorCode, errorDescription, _validatedURL, isMainFrame) => {
+      entry.isLoading = false;
+      sendToRenderer('view:loading-state', { accountId, isLoading: false });
+      if (errorCode !== -3 && isMainFrame !== false) {
+        entry.pendingMainLoadFailed = true;
+        entry.hasError = true;
+        layoutViews();
+        sendToRenderer('view:did-fail-load', { accountId, errorCode, errorDescription });
+      }
+    });
+
+    wc.on('dom-ready', () => {
+      const loadedUrl = wc.getURL() || '';
+      if (entry.pendingMainLoadFailed || loadedUrl.startsWith('chrome-error:')) {
+        return;
+      }
+      if (entry.hasError) {
+        entry.hasError = false;
+        layoutViews();
+        sendToRenderer('view:did-recover-load', { accountId });
+      }
+      try {
+        wc.setZoomFactor(entry.zoomFactor);
+      } catch {}
+      applyThemeToEntry(entry);
+      injectBridges();
+      pollViewNotifications(entry);
+
+      wc.executeJavaScript(`
+        (() => {
+          window.addEventListener('dragover', (e) => {
+            if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.includes('Files')) {
+              e.dataTransfer.dropEffect = 'copy';
+            }
+          });
+        })()
+      `).catch(() => {});
+    });
+
+    wc.on('did-navigate', injectBridges);
+    wc.on('did-navigate-in-page', injectBridges);
+
+    wc.on('page-title-updated', (_event, title) => {
+      const badge = parseDiscordTitleUnread(title);
+      sendToRenderer('view:notification-updated', { accountId, badge });
+    });
+
+    attachNavigationAndShortcutHandlers(entry);
+
+    if (isBossKeyMuted || globalDeafenedState) {
+      wc.setAudioMuted(true);
+    }
+
+    if (!proxyResult.ok) {
+      entry.hasError = true;
+      layoutViews();
+      sendToRenderer('view:did-fail-load', {
+        accountId,
+        errorCode: 'ERR_INVALID_PROXY_CONFIG',
+        errorDescription: proxyResult.error
+      });
+      return proxyResult;
+    }
+
+    wc.loadURL(DISCORD_APP_URL).catch(() => {});
+  } else {
+    entry.hasProxy = proxyResult.hasProxy;
+    entry.view.webContents.setWebRTCIPHandlingPolicy(
+      proxyResult.hasProxy ? 'disable_non_proxied_udp' : 'default'
+    );
+  }
+
+  return proxyResult;
+}
+
+function wakeEntryIfHibernated(entry) {
+  if (!entry || !entry.isHibernated || entry.view.webContents.isDestroyed()) return;
+  entry.isHibernated = false;
+  const wc = entry.view.webContents;
+  try {
+    if (typeof wc.setImageAnimationPolicy === 'function') {
+      wc.setImageAnimationPolicy('animate');
+    }
+    if (entry.hibernationCssKey) {
+      const key = entry.hibernationCssKey;
+      entry.hibernationCssKey = null;
+      wc.removeInsertedCSS(key).catch(() => {});
+    }
+  } catch {}
+}
+
+function layoutViews() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  const rect = layoutState.containerRect;
+  const hasArea = rect && rect.width > 0 && rect.height > 0;
+  const panes = computePaneBounds(rect, {
+    isSplitView: layoutState.isSplitView,
+    dividerPx: 2
+  });
+
+  const primaryId = layoutState.isSplitView ? layoutState.splitPrimaryId : layoutState.activeAccountId;
+  const secondaryId = layoutState.isSplitView ? layoutState.splitSecondaryId : null;
+
+  for (const [id, entry] of accountViews.entries()) {
+    if (entry.view.webContents.isDestroyed()) continue;
+
+    if (layoutState.overlayBlocked || !hasArea || entry.hasError) {
+      entry.view.setVisible(false);
+      continue;
+    }
+
+    if (id === primaryId && panes.primary) {
+      wakeEntryIfHibernated(entry);
+      entry.view.setBounds(panes.primary);
+      entry.view.setVisible(true);
+    } else if (layoutState.isSplitView && id === secondaryId && panes.secondary) {
+      wakeEntryIfHibernated(entry);
+      entry.view.setBounds(panes.secondary);
+      entry.view.setVisible(true);
+    } else {
+      entry.view.setVisible(false);
+    }
+  }
+
+  if (layoutState.overlayBlocked) {
+    hideHudView();
+  } else if (hudView && hudView.getVisible()) {
+    mainWindow.contentView.addChildView(hudView);
+  }
+}
+
+function reloadAccountView(accountId, ignoreCache = false) {
+  const entry = accountViews.get(accountId);
+  if (!entry || entry.view.webContents.isDestroyed()) return;
+  entry.pendingMainLoadFailed = false;
+  entry.hasError = false;
+  layoutViews();
+  sendToRenderer('view:did-recover-load', { accountId });
+  const wc = entry.view.webContents;
+  const currentUrl = wc.getURL();
+  if (!currentUrl || currentUrl === 'about:blank' || currentUrl.startsWith('chrome-error:')) {
+    wc.loadURL(DISCORD_APP_URL).catch(() => {});
+  } else if (ignoreCache) {
+    wc.reloadIgnoringCache();
+  } else {
+    wc.reload();
+  }
+}
+
+async function destroyAccountView(accountId, wipeSessionData = true) {
+  const entry = accountViews.get(accountId);
+  if (entry) {
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.contentView.removeChildView(entry.view);
+      }
+    } catch {}
+    try {
+      if (!entry.view.webContents.isDestroyed()) {
+        entry.view.webContents.close();
+      }
+    } catch {}
+    accountViews.delete(accountId);
+  }
+  audioMuteStateBeforeBossKey.delete(accountId);
+
+  const partition = partitionForAccountId(accountId);
+  const ses = session.fromPartition(partition);
+  proxyAuthBySession.delete(ses);
+
+  if (wipeSessionData) {
+    try {
+      await ses.closeAllConnections();
+      await ses.clearStorageData();
+      await ses.clearCache();
+      await ses.clearAuthCache();
+      log(`Wiped session storage, cookies, and cache for removed account [${partition}]`);
+    } catch (err) {
+      log(`Failed to wipe session data for [${partition}]: ${err}`);
+    }
+  }
+}
+
+// ============================================================================
+// Boss Key & Audio State Restoration (Never Locks Accounts Muted)
+// ============================================================================
+function restoreFromBossKeyIfNeeded() {
+  if (!isBossKeyMuted) return;
+  isBossKeyMuted = false;
+  for (const [id, entry] of accountViews.entries()) {
+    const wc = entry.view.webContents;
+    if (wc.isDestroyed()) continue;
+    const prevMuted = audioMuteStateBeforeBossKey.get(id);
+    wc.setAudioMuted(Boolean(prevMuted) || globalDeafenedState);
+  }
+  audioMuteStateBeforeBossKey.clear();
+  log('Boss Key audio state restored');
+}
+
+function handleBossKey() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isVisible()) {
+    if (!isBossKeyMuted) {
+      audioMuteStateBeforeBossKey.clear();
+      for (const [id, entry] of accountViews.entries()) {
+        const wc = entry.view.webContents;
+        if (!wc.isDestroyed()) {
+          audioMuteStateBeforeBossKey.set(id, wc.isAudioMuted());
+          wc.setAudioMuted(true);
+        }
+      }
+      isBossKeyMuted = true;
+    }
+    mainWindow.hide();
+    updateTrayMenu();
+    log('Emergency Boss Key triggered: window hidden to tray & audio muted');
+  } else {
+    mainWindow.show();
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+    restoreFromBossKeyIfNeeded();
+    updateTrayMenu();
+    log('Emergency Boss Key triggered: window restored & audio unmuted');
+  }
+}
+
+// ============================================================================
+// Global OS Shortcuts (Disabled by Default — Opt-in via Settings)
+// ============================================================================
+function applyGlobalShortcutsSetting() {
+  try {
+    globalShortcut.unregisterAll();
+  } catch {}
+
+  if (!mainSettings.globalShortcutsEnabled) {
+    log('Global OS shortcuts are disabled (opt-in setting is off)');
+    return { enabled: false, registeredCount: 0 };
+  }
+
+  let registeredCount = 0;
+  try {
+    if (globalShortcut.register('CommandOrControl+Alt+M', () => sendToRenderer('trigger-global-mute-all'))) {
+      registeredCount += 1;
+    }
+    if (globalShortcut.register('CommandOrControl+Alt+D', () => sendToRenderer('trigger-global-deafen-all'))) {
+      registeredCount += 1;
+    }
+    if (globalShortcut.register('CommandOrControl+Shift+H', () => handleBossKey())) {
+      registeredCount += 1;
+    }
+    log(`Global OS shortcuts enabled (${registeredCount}/3 registered)`);
+  } catch (err) {
+    log(`Failed to register global shortcuts: ${err}`);
+  }
+  return { enabled: true, registeredCount };
+}
+
+// ============================================================================
+// Main BrowserWindow & System Tray
+// ============================================================================
+function resolveAppIconPath() {
+  const icoPath = path.join(__dirname, 'assets', 'icon.ico');
+  if (fs.existsSync(icoPath)) return icoPath;
+  const pngPath = path.join(__dirname, 'assets', 'icon.png');
+  if (fs.existsSync(pngPath)) return pngPath;
+  return path.join(__dirname, 'tray-icon.png');
+}
+
 function createWindow() {
+  setupSession(session.defaultSession);
+
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 800,
@@ -247,257 +1361,47 @@ function createWindow() {
     minHeight: 560,
     center: true,
     backgroundColor: '#1e1f22',
-    show: true,
+    show: !START_HIDDEN && !IS_TEST_MODE,
     autoHideMenuBar: true,
     title: 'Discord MultiSpace',
+    icon: resolveAppIconPath(),
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: true,
       preload: path.join(__dirname, 'preload.js'),
-      webviewTag: true,
-      spellcheck: true
+      webviewTag: false,
+      spellcheck: false
     }
   });
 
-  mainWindow.webContents.on('console-message', (event, level, message, line, sourceId) => {
-    log(`[RENDERER] (${line}) ${message}`);
+  // Electron 45 console-message details object signature
+  mainWindow.webContents.on('console-message', ({ level, message, lineNumber }) => {
+    log(`[RENDERER:${level || 'info'}] (${lineNumber || 0}) ${message}`);
   });
 
-  // Configure default session
-  setupSession(session.defaultSession);
-
-  // Configure newly created sessions (custom partitions)
-  app.on('session-created', (newSession) => {
-    setupSession(newSession);
+  // Shell index.html must never navigate or redirect to any external or local file URL
+  mainWindow.webContents.on('will-navigate', (details) => {
+    details.preventDefault();
   });
-
-  // Code injected into Discord webviews to guarantee screen sharing captures crystal-clear system audio or custom hardware input
-  const DISCORD_MEDIA_AUDIO_PATCH = `
-    (() => {
-      try {
-        if (window.__discordMultiSpaceAudioPatched) return;
-        window.__discordMultiSpaceAudioPatched = true;
-
-        if (navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function') {
-          const originalGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
-          navigator.mediaDevices.getDisplayMedia = async function(constraints) {
-            const safe = (typeof constraints === 'object' && constraints !== null)
-              ? Object.assign({}, constraints)
-              : { video: true };
-
-            if (!safe.audio || typeof safe.audio !== 'object') {
-              safe.audio = {
-                autoGainControl: false,
-                echoCancellation: false,
-                noiseSuppression: false,
-                systemAudio: 'include'
-              };
-            } else {
-              safe.audio.autoGainControl = false;
-              safe.audio.echoCancellation = false;
-              safe.audio.noiseSuppression = false;
-              safe.audio.systemAudio = 'include';
-            }
-
-            const stream = await originalGetDisplayMedia(safe);
-
-            const targetLabel = (window.__discordMultiSpaceAudioDeviceLabel || 'loopback').trim();
-            if (targetLabel && targetLabel !== 'loopback' && navigator.mediaDevices.getUserMedia) {
-              try {
-                const devices = await navigator.mediaDevices.enumerateDevices();
-                const cleanTarget = targetLabel.toLowerCase();
-                const matched = devices.find(d =>
-                  d.kind === 'audioinput' &&
-                  d.label &&
-                  (d.label.toLowerCase().includes(cleanTarget) || cleanTarget.includes(d.label.toLowerCase()))
-                );
-
-                if (matched && matched.deviceId) {
-                  const customStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                      deviceId: { exact: matched.deviceId },
-                      autoGainControl: false,
-                      echoCancellation: false,
-                      noiseSuppression: false,
-                      channelCount: 2
-                    }
-                  });
-                  const customTrack = customStream.getAudioTracks()[0];
-                  if (customTrack) {
-                    customTrack.enabled = true;
-                    if ('contentHint' in customTrack) {
-                      try { customTrack.contentHint = 'music'; } catch (e) {}
-                    }
-                    stream.getAudioTracks().forEach(t => {
-                      try { stream.removeTrack(t); t.stop(); } catch (e) {}
-                    });
-                    stream.addTrack(customTrack);
-                  }
-                }
-              } catch (err) {
-                console.warn('[MultiSpace] Custom audio track injection failed, retaining default loopback:', err);
-              }
-            } else {
-              const audioTracks = stream.getAudioTracks();
-              if (audioTracks && audioTracks.length > 0) {
-                audioTracks.forEach((track) => {
-                  track.enabled = true;
-                  if ('contentHint' in track) {
-                    try { track.contentHint = 'music'; } catch (e) {}
-                  }
-                });
-              }
-            }
-
-            return stream;
-          };
-        }
-      } catch (e) {}
-    })();
-  `;
-
-  // Handle all web-contents (including webviews)
-  app.on('web-contents-created', (event, contents) => {
-    if (contents.session) {
-      setupSession(contents.session);
+  mainWindow.webContents.on('will-redirect', (details) => {
+    details.preventDefault();
+  });
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (typeof url === 'string' && (url.startsWith('https://') || url.startsWith('http://'))) {
+      shell.openExternal(url).catch(() => {});
     }
-
-    // Inject screen-share loopback audio bridge into Discord web views
-    if (contents.getType() === 'webview') {
-      const injectBridge = () => {
-        if (!contents.isDestroyed()) {
-          contents.executeJavaScript(DISCORD_MEDIA_AUDIO_PATCH).catch(() => {});
-          contents.executeJavaScript(`window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(currentStreamAudioDeviceLabel)};`).catch(() => {});
-        }
-      };
-      contents.on('dom-ready', injectBridge);
-      contents.on('did-finish-load', injectBridge);
-      contents.on('did-navigate', injectBridge);
-      contents.on('did-navigate-in-page', injectBridge);
-    }
-
-    // Intercept window.open popups & OAuth flows to open safely in external browser
-    contents.setWindowOpenHandler(({ url }) => {
-      if (url.startsWith('http://') || url.startsWith('https://')) {
-        shell.openExternal(url);
-      }
-      return { action: 'deny' };
-    });
-
-    // Native spellcheck & text editing context menu
-    contents.on('context-menu', (event, params) => {
-      const hasSuggestions = params.dictionarySuggestions && params.dictionarySuggestions.length > 0;
-      const isEditable = params.isEditable;
-      const hasSelection = params.selectionText && params.selectionText.trim().length > 0;
-
-      // Only show menu if there are spelling suggestions, editable input, or selected text
-      if (!hasSuggestions && !isEditable && !hasSelection) {
-        return;
-      }
-
-      const menuTemplate = [];
-
-      // Spelling suggestions
-      if (hasSuggestions) {
-        params.dictionarySuggestions.forEach((suggestion) => {
-          menuTemplate.push({
-            label: suggestion,
-            click: () => contents.replaceMisspelling(suggestion)
-          });
-        });
-        if (params.misspelledWord) {
-          menuTemplate.push({
-            label: `Add "${params.misspelledWord}" to Dictionary`,
-            click: () => {
-              try {
-                contents.session.addWordToSpellCheckerDictionary(params.misspelledWord);
-              } catch {}
-            }
-          });
-        }
-        menuTemplate.push({ type: 'separator' });
-      }
-
-      // Text editing actions
-      if (isEditable) {
-        menuTemplate.push(
-          { role: 'undo', enabled: params.editFlags.canUndo },
-          { role: 'redo', enabled: params.editFlags.canRedo },
-          { type: 'separator' },
-          { role: 'cut', enabled: params.editFlags.canCut },
-          { role: 'copy', enabled: params.editFlags.canCopy },
-          { role: 'paste', enabled: params.editFlags.canPaste },
-          { role: 'selectAll', enabled: params.editFlags.canSelectAll }
-        );
-      } else if (hasSelection) {
-        menuTemplate.push(
-          { role: 'copy', enabled: params.editFlags.canCopy },
-          { role: 'selectAll', enabled: params.editFlags.canSelectAll }
-        );
-      }
-
-      if (menuTemplate.length > 0) {
-        const menu = Menu.buildFromTemplate(menuTemplate);
-        menu.popup({ window: mainWindow });
-      }
-    });
-
-    // Handle guest keyboard shortcuts (App reload, Zoom in/out/reset)
-    contents.on('before-input-event', (inputEvent, input) => {
-      if (input.type === 'keyDown' && (input.control || input.meta)) {
-        if (input.shift && input.key.toLowerCase() === 'r') {
-          if (mainWindow) mainWindow.reload();
-          return;
-        }
-
-        // Per-pane Zoom Controls
-        if (input.key === '+' || input.key === '=' || input.key === 'Add') {
-          if (mainWindow) {
-            mainWindow.webContents.send('webview-zoom-action', { webContentsId: contents.id, action: 'in' });
-          }
-        } else if (input.key === '-' || input.key === 'Subtract') {
-          if (mainWindow) {
-            mainWindow.webContents.send('webview-zoom-action', { webContentsId: contents.id, action: 'out' });
-          }
-        } else if (input.key === '0' || input.key === 'NumPad0') {
-          if (mainWindow) {
-            mainWindow.webContents.send('webview-zoom-action', { webContentsId: contents.id, action: 'reset' });
-          }
-        }
-      }
-    });
-
-    // If webview attempts to navigate to external websites or local dropped files, handle safely
-    contents.on('will-navigate', (navEvent, navigationUrl) => {
-      // Prevent local file drops from replacing the Discord page
-      if (navigationUrl.startsWith('file://') && !navigationUrl.includes('index.html')) {
-        navEvent.preventDefault();
-        return;
-      }
-
-      try {
-        const parsedUrl = new URL(navigationUrl);
-        const allowedHosts = [
-          'discord.com',
-          'discordapp.com',
-          'discord.gg',
-          'cdn.discordapp.com',
-          'gateway.discord.gg',
-          'status.discord.com'
-        ];
-        const isDiscordHost = allowedHosts.some(
-          (host) => parsedUrl.hostname === host || parsedUrl.hostname.endsWith('.' + host)
-        );
-
-        if (!isDiscordHost && (navigationUrl.startsWith('http://') || navigationUrl.startsWith('https://'))) {
-          navEvent.preventDefault();
-          shell.openExternal(navigationUrl);
-        }
-      } catch (err) {
-        // Invalid URL, ignore
-      }
-    });
+    return { action: 'deny' };
   });
+
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.type === 'keyDown' && (input.control || input.meta) && input.shift && input.key.toLowerCase() === 'r') {
+      event.preventDefault();
+      mainWindow.reload();
+    }
+  });
+
+  createHudView();
 
   mainWindow.loadFile(path.join(__dirname, 'index.html')).then(() => {
     log('mainWindow.loadFile completed');
@@ -505,18 +1409,14 @@ function createWindow() {
     log(`Failed to load index.html: ${err}`);
   });
 
-  mainWindow.webContents.on('before-input-event', (event, input) => {
-    if (input.control && input.shift && input.key.toLowerCase() === 'r') {
-      mainWindow.reload();
-    }
-  });
+  if (!START_HIDDEN && !IS_TEST_MODE) {
+    mainWindow.center();
+    mainWindow.show();
+    mainWindow.focus();
+  } else {
+    log(`Window started hidden (START_HIDDEN=${START_HIDDEN}, IS_TEST_MODE=${IS_TEST_MODE})`);
+  }
 
-  mainWindow.center();
-  mainWindow.show();
-  mainWindow.focus();
-  log('mainWindow created, centered, and focused');
-
-  // Minimize to tray on close unless quitting
   mainWindow.on('close', (event) => {
     if (!app.isQuitting) {
       event.preventDefault();
@@ -526,17 +1426,17 @@ function createWindow() {
   });
 
   mainWindow.on('show', () => {
+    restoreFromBossKeyIfNeeded();
     updateTrayMenu();
+    layoutViews();
   });
 
   mainWindow.on('hide', () => {
+    hideHudView();
     updateTrayMenu();
   });
 }
 
-/**
- * System Tray Management
- */
 function createTray() {
   try {
     const iconPath = path.join(__dirname, 'tray-icon.png');
@@ -549,67 +1449,39 @@ function createTray() {
     tray = new Tray(icon);
     updateTrayMenu();
 
-    tray.on('click', () => {
-      toggleWindow();
-    });
-
-    tray.on('double-click', () => {
-      toggleWindow();
-    });
-
+    tray.on('click', () => toggleWindow());
+    tray.on('double-click', () => toggleWindow());
     log('System tray initialized successfully');
   } catch (err) {
-    log(`Failed to create system tray: ${err.stack || err}`);
+    log(`Failed to create system tray: ${(err && err.stack) || err}`);
   }
 }
 
 function updateTrayMenu() {
   if (!tray) return;
 
-  const isWinVisible = mainWindow && mainWindow.isVisible();
+  const isWinVisible = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible());
   const contextMenu = Menu.buildFromTemplate([
-    {
-      label: 'Discord MultiSpace',
-      enabled: false
-    },
-    {
-      type: 'separator'
-    },
-    {
-      label: `● Active Account: ${appState.activeAccountName}`,
-      enabled: false
-    },
-    {
-      label: `📋 Accounts Configured: ${appState.accountCount}`,
-      enabled: false
-    },
-    ...(appState.unreadCount > 0 ? [
-      {
-        label: `🔔 Unread Mentions / Messages: ${appState.unreadCount}`,
-        enabled: false
-      }
-    ] : []),
-    {
-      type: 'separator'
-    },
+    { label: 'Discord MultiSpace', enabled: false },
+    { type: 'separator' },
+    { label: `● Active Account: ${appState.activeAccountName}`, enabled: false },
+    { label: `📋 Accounts Configured: ${appState.accountCount}`, enabled: false },
+    ...(appState.unreadCount > 0
+      ? [{ label: `🔔 Unread Mentions / Messages: ${appState.unreadCount}`, enabled: false }]
+      : []),
+    { type: 'separator' },
     {
       label: isWinVisible ? 'Hide Window' : 'Open Discord MultiSpace',
-      click: () => {
-        toggleWindow();
-      }
+      click: () => toggleWindow()
     },
     {
       label: 'Reload Active Session',
-      click: () => {
-        if (mainWindow) {
-          mainWindow.webContents.send('tray-reload-session');
-        }
-      }
+      click: () => sendToRenderer('tray-reload-session')
     },
     {
       label: '🔄 Check for Updates...',
       click: () => {
-        if (mainWindow) {
+        if (mainWindow && !mainWindow.isDestroyed()) {
           if (!mainWindow.isVisible()) mainWindow.show();
           if (mainWindow.isMinimized()) mainWindow.restore();
           mainWindow.focus();
@@ -617,9 +1489,7 @@ function updateTrayMenu() {
         triggerUpdateCheck(true);
       }
     },
-    {
-      type: 'separator'
-    },
+    { type: 'separator' },
     {
       label: 'Quit Discord MultiSpace',
       click: () => {
@@ -635,24 +1505,467 @@ function updateTrayMenu() {
 }
 
 function toggleWindow() {
-  if (!mainWindow) return;
+  if (!mainWindow || mainWindow.isDestroyed()) return;
   if (mainWindow.isVisible()) {
     mainWindow.hide();
   } else {
     mainWindow.show();
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
+    restoreFromBossKeyIfNeeded();
   }
   updateTrayMenu();
 }
 
-// IPC listener for renderer status updates
+// ============================================================================
+// IPC Handlers (All Sender-Verified & Input-Validated)
+// ============================================================================
+ipcMain.handle('views:validate-proxy', (event, rawProxy) => {
+  if (!isTrustedSender(event)) return { valid: false, error: 'Unauthorized sender' };
+  return parseAndValidateProxy(typeof rawProxy === 'string' ? rawProxy : '');
+});
+
+ipcMain.handle('views:sync-accounts', async (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') {
+    return { ok: false };
+  }
+
+  const incomingAccounts = Array.isArray(payload.accounts) ? payload.accounts : [];
+  const validIds = new Set();
+  const proxyErrors = {};
+
+  if (typeof payload.overlayBlocked === 'boolean') {
+    layoutState.overlayBlocked = payload.overlayBlocked;
+  }
+  if (payload.containerRect && typeof payload.containerRect === 'object') {
+    layoutState.containerRect = payload.containerRect;
+  }
+  layoutState.activeAccountId = isValidAccountId(payload.activeAccountId) ? payload.activeAccountId : null;
+  layoutState.isSplitView = Boolean(payload.isSplitView);
+  layoutState.splitPrimaryId = isValidAccountId(payload.splitPrimaryId) ? payload.splitPrimaryId : null;
+  layoutState.splitSecondaryId = isValidAccountId(payload.splitSecondaryId) ? payload.splitSecondaryId : null;
+
+  for (const acc of incomingAccounts) {
+    if (!acc || typeof acc !== 'object' || !isValidAccountId(acc.id)) continue;
+    validIds.add(acc.id);
+    const res = await ensureAccountView(acc);
+    if (!res.ok && res.error) {
+      proxyErrors[acc.id] = res.error;
+    }
+  }
+
+  // Destroy views that are no longer in the accounts list (without wiping storage unless remove-account requested it)
+  for (const existingId of Array.from(accountViews.keys())) {
+    if (!validIds.has(existingId)) {
+      await destroyAccountView(existingId, false);
+    }
+  }
+
+  layoutViews();
+  return { ok: true, proxyErrors };
+});
+
+ipcMain.handle('views:update-account-proxy', async (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') {
+    return { ok: false, error: 'Invalid request' };
+  }
+  const { accountId, proxy } = payload;
+  if (!isValidAccountId(accountId)) {
+    return { ok: false, error: 'Invalid account ID' };
+  }
+
+  const validation = parseAndValidateProxy(proxy || '');
+  if (!validation.valid) {
+    return { ok: false, error: validation.error };
+  }
+
+  const res = await configureAccountSessionProxy(accountId, proxy || '');
+  const entry = accountViews.get(accountId);
+  if (entry && !entry.view.webContents.isDestroyed()) {
+    entry.hasProxy = res.hasProxy;
+    entry.hasError = false;
+    entry.view.webContents.setWebRTCIPHandlingPolicy(
+      res.hasProxy ? 'disable_non_proxied_udp' : 'default'
+    );
+    layoutViews();
+    sendToRenderer('view:did-recover-load', { accountId });
+    entry.view.webContents.loadURL(DISCORD_APP_URL).catch(() => {});
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('views:remove-account', async (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') {
+    return { ok: false };
+  }
+  const { accountId, wipeSessionData } = payload;
+  if (!isValidAccountId(accountId)) {
+    return { ok: false, error: 'Invalid account ID' };
+  }
+  const shouldWipe = wipeSessionData !== false;
+  await destroyAccountView(accountId, shouldWipe);
+  layoutViews();
+  return { ok: true, wiped: shouldWipe };
+});
+
+ipcMain.handle('views:set-layout', (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') {
+    return { ok: false };
+  }
+  if (isValidAccountId(payload.activeAccountId)) {
+    layoutState.activeAccountId = payload.activeAccountId;
+  }
+  layoutState.isSplitView = Boolean(payload.isSplitView);
+  layoutState.splitPrimaryId = isValidAccountId(payload.splitPrimaryId) ? payload.splitPrimaryId : null;
+  layoutState.splitSecondaryId = isValidAccountId(payload.splitSecondaryId) ? payload.splitSecondaryId : null;
+  if (payload.containerRect && typeof payload.containerRect === 'object') {
+    layoutState.containerRect = payload.containerRect;
+  }
+
+  layoutViews();
+
+  if (!layoutState.overlayBlocked && payload.focusActive) {
+    const focusId = layoutState.isSplitView ? layoutState.splitPrimaryId : layoutState.activeAccountId;
+    const entry = focusId ? accountViews.get(focusId) : null;
+    if (entry && !entry.hasError && !entry.view.webContents.isDestroyed()) {
+      try {
+        entry.view.webContents.focus();
+      } catch {}
+    }
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('views:set-overlay-blocked', async (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') {
+    return { ok: false, snapshots: {} };
+  }
+
+  const nextBlocked = Boolean(payload.blocked);
+  const snapshots = {};
+
+  if (nextBlocked && !layoutState.overlayBlocked) {
+    const visibleIds = layoutState.isSplitView
+      ? [layoutState.splitPrimaryId, layoutState.splitSecondaryId].filter(Boolean)
+      : [layoutState.activeAccountId].filter(Boolean);
+
+    for (const id of visibleIds) {
+      const entry = accountViews.get(id);
+      if (entry && entry.view.getVisible() && !entry.hasError && !entry.view.webContents.isDestroyed()) {
+        try {
+          const img = await entry.view.webContents.capturePage();
+          if (img && !img.isEmpty()) {
+            snapshots[id] = img.toDataURL();
+          }
+        } catch {}
+      }
+    }
+  }
+
+  layoutState.overlayBlocked = nextBlocked;
+  layoutViews();
+  return { ok: true, snapshots };
+});
+
+const MINIMALIST_CSS = `/* Clean Minimalist Theme */
+button[aria-label="Send a gift"],
+button[aria-label="Open GIF picker"],
+button[aria-label="Open sticker picker"],
+div[aria-label="Open GIF picker"],
+div[aria-label="Open sticker picker"],
+a[href="/shop"],
+a[href="/nitro"],
+li:has(a[href="/shop"]),
+li:has(a[href="/nitro"]) {
+  display: none !important;
+}
+::-webkit-scrollbar { width: 5px !important; height: 5px !important; }
+::-webkit-scrollbar-track { background: transparent !important; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2) !important; border-radius: 6px !important; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.35) !important; }`;
+
+ipcMain.handle('views:apply-theme', async (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') {
+    return { ok: false, error: 'Unauthorized' };
+  }
+
+  const presetId = typeof payload.presetId === 'string' ? payload.presetId : 'default';
+  const customCss = typeof payload.customCss === 'string' ? payload.customCss.trim() : '';
+
+  try {
+    if (presetId === 'default' || (!customCss && presetId === 'custom')) {
+      isCustomThemeActive = false;
+      currentResolvedThemeCss = '';
+    } else if (presetId === 'minimalist') {
+      // Minimalist uses pure local selectors with zero external font/image assets -> keep strict Discord CSP!
+      isCustomThemeActive = false;
+      currentResolvedThemeCss = MINIMALIST_CSS;
+    } else if (presetId === 'midnight') {
+      isCustomThemeActive = true;
+      currentResolvedThemeCss = await fs.promises.readFile(
+        path.join(__dirname, 'assets', 'themes', 'midnight.css'),
+        'utf8'
+      );
+    } else if (presetId === 'amoled') {
+      isCustomThemeActive = true;
+      currentResolvedThemeCss = await fs.promises.readFile(
+        path.join(__dirname, 'assets', 'themes', 'amoled.css'),
+        'utf8'
+      );
+    } else {
+      isCustomThemeActive = true;
+      let resolved = customCss;
+      const importMatch = resolved.match(/@import\s+url\(\s*['"]?(https?:\/\/[^'")\s]+)['"]?\s*\)\s*;?/i);
+      if (importMatch && importMatch[1]) {
+        const fetched = await safeFetchThemeCss(importMatch[1], { userAgent: CHROME_USER_AGENT });
+        if (!fetched.success) {
+          return { ok: false, error: fetched.error || 'Failed to load remote theme CSS.' };
+        }
+        const rest = resolved.replace(importMatch[0], '').trim();
+        resolved = `${fetched.css}\n\n${rest}`.trim();
+      }
+      currentResolvedThemeCss = resolved;
+    }
+
+    await Promise.all(Array.from(accountViews.values()).map((entry) => applyThemeToEntry(entry)));
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+});
+
+// Scoped Discord Voice Status Bar Mute / Deafen (Excludes Channel/Server/User Mute buttons!)
+ipcMain.handle('views:set-mute-all', async (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return { ok: false };
+  const targetMuted = Boolean(payload.muted);
+
+  const script = `
+    (() => {
+      try {
+        const targetMuted = ${targetMuted};
+        const candidates = Array.from(document.querySelectorAll('section[aria-label] button[aria-label], [class*="panels_"] button[aria-label]'));
+        const muteBtn = candidates.find((b) => {
+          const l = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+          if (l.includes('channel') || l.includes('server') || l.includes('deafen')) return false;
+          return l === 'mute' || l === 'unmute' || l.startsWith('mute ') || l.startsWith('unmute ');
+        });
+        if (muteBtn) {
+          const label = (muteBtn.getAttribute('aria-label') || '').toLowerCase();
+          const ariaChecked = muteBtn.getAttribute('aria-checked');
+          const isCurrentlyMuted = ariaChecked === 'true' || label.startsWith('unmute');
+          if (targetMuted !== isCurrentlyMuted) {
+            muteBtn.click();
+          }
+          return { clicked: true };
+        }
+        return { clicked: false };
+      } catch {
+        return { clicked: false };
+      }
+    })()
+  `;
+
+  for (const entry of accountViews.values()) {
+    const wc = entry.view.webContents;
+    if (wc.isDestroyed()) continue;
+    try {
+      const res = await wc.executeJavaScript(script);
+      if (!res || !res.clicked) {
+        wc.sendInputEvent({ type: 'keyDown', keyCode: 'M', modifiers: ['control', 'shift'] });
+        wc.sendInputEvent({ type: 'keyUp', keyCode: 'M', modifiers: ['control', 'shift'] });
+      }
+    } catch {}
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('views:set-deafen-all', async (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return { ok: false };
+  const targetDeafened = Boolean(payload.deafened);
+  globalDeafenedState = targetDeafened;
+
+  const script = `
+    (() => {
+      try {
+        const targetDeafened = ${targetDeafened};
+        const candidates = Array.from(document.querySelectorAll('section[aria-label] button[aria-label], [class*="panels_"] button[aria-label]'));
+        const deafenBtn = candidates.find((b) => {
+          const l = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+          return l === 'deafen' || l === 'undeafen' || l.startsWith('deafen ') || l.startsWith('undeafen ');
+        });
+        if (deafenBtn) {
+          const label = (deafenBtn.getAttribute('aria-label') || '').toLowerCase();
+          const ariaChecked = deafenBtn.getAttribute('aria-checked');
+          const isCurrentlyDeafened = ariaChecked === 'true' || label.startsWith('undeafen');
+          if (targetDeafened !== isCurrentlyDeafened) {
+            deafenBtn.click();
+          }
+          return { clicked: true };
+        }
+        return { clicked: false };
+      } catch {
+        return { clicked: false };
+      }
+    })()
+  `;
+
+  for (const entry of accountViews.values()) {
+    const wc = entry.view.webContents;
+    if (wc.isDestroyed()) continue;
+    try {
+      if (!isBossKeyMuted) {
+        wc.setAudioMuted(targetDeafened);
+      }
+      const res = await wc.executeJavaScript(script);
+      if (!res || !res.clicked) {
+        wc.sendInputEvent({ type: 'keyDown', keyCode: 'D', modifiers: ['control', 'shift'] });
+        wc.sendInputEvent({ type: 'keyUp', keyCode: 'D', modifiers: ['control', 'shift'] });
+      }
+    } catch {}
+  }
+  return { ok: true };
+});
+
+// Real Background Memory/CPU Saver: Enables Chromium background throttling, freezes GIF/CSS animations, and NEVER mutes incoming DM/Call audio!
+const HIBERNATION_PAUSE_CSS = '* , *::before, *::after { animation-play-state: paused !important; transition: none !important; }';
+
+ipcMain.handle('views:check-hibernation', async (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') {
+    return { hibernatedIds: [] };
+  }
+
+  if (!payload.memorySaverEnabled) {
+    for (const entry of accountViews.values()) {
+      wakeEntryIfHibernated(entry);
+      if (!entry.view.webContents.isDestroyed()) {
+        entry.view.webContents.setBackgroundThrottling(false);
+      }
+    }
+    return { hibernatedIds: [] };
+  }
+
+  for (const entry of accountViews.values()) {
+    if (!entry.view.webContents.isDestroyed()) {
+      entry.view.webContents.setBackgroundThrottling(true);
+    }
+  }
+
+  const candidateIds = Array.isArray(payload.idleAccountIds) ? payload.idleAccountIds : [];
+  const hibernatedIds = [];
+
+  for (const id of candidateIds) {
+    if (!isValidAccountId(id)) continue;
+    const entry = accountViews.get(id);
+    if (!entry || entry.view.getVisible() || entry.view.webContents.isDestroyed()) continue;
+
+    try {
+      const wc = entry.view.webContents;
+      const inVoice = await wc.executeJavaScript(`
+        (() => !!document.querySelector('[class*="rtcConnectionStatusConnected"], [class*="voiceChannelEffect"], [class*="connected_"]'))()
+      `);
+      if (!inVoice) {
+        entry.isHibernated = true;
+        wc.setBackgroundThrottling(true);
+        if (typeof wc.setImageAnimationPolicy === 'function') {
+          wc.setImageAnimationPolicy('noAnimation');
+        }
+        if (!entry.hibernationCssKey) {
+          entry.hibernationCssKey = await wc.insertCSS(HIBERNATION_PAUSE_CSS).catch(() => null);
+        }
+        hibernatedIds.push(id);
+      }
+    } catch {}
+  }
+
+  return { hibernatedIds };
+});
+
+ipcMain.on('views:reload-account', (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return;
+  if (!isValidAccountId(payload.accountId)) return;
+  reloadAccountView(payload.accountId, Boolean(payload.ignoreCache));
+});
+
+ipcMain.on('views:retry-account', (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return;
+  if (!isValidAccountId(payload.accountId)) return;
+  reloadAccountView(payload.accountId, false);
+});
+
+ipcMain.on('views:set-zoom', (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return;
+  if (!isValidAccountId(payload.accountId) || typeof payload.zoomFactor !== 'number') return;
+  const entry = accountViews.get(payload.accountId);
+  if (!entry || entry.view.webContents.isDestroyed()) return;
+  const clamped = Math.min(2.0, Math.max(0.5, Math.round(payload.zoomFactor * 10) / 10));
+  entry.zoomFactor = clamped;
+  try {
+    entry.view.webContents.setZoomFactor(clamped);
+  } catch {}
+});
+
+// HUD IPC Handlers
+ipcMain.on('hud:show-tooltip', (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return;
+  if (!payload.visible) {
+    hideHudView();
+    return;
+  }
+  const text = escapeHtml(payload.text || '');
+  const shortcut = payload.shortcut ? `<span class="hud-shortcut">${escapeHtml(payload.shortcut)}</span>` : '';
+  const estimatedWidth = Math.min(340, Math.max(120, (String(payload.text || '').length * 8) + (payload.shortcut ? 72 : 36)));
+  const y = Math.max(8, Math.round(Number(payload.y) || 12));
+  showHudCard({
+    x: 78,
+    y,
+    width: estimatedWidth,
+    height: 40,
+    htmlPayload: `<div class="hud-pill"><span>${text}</span>${shortcut}</div>`,
+    autoHideMs: 0
+  });
+});
+
+ipcMain.on('hud:show-toast', (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return;
+  if (!mainWindow || mainWindow.isDestroyed() || layoutState.overlayBlocked) return;
+  const [winWidth, winHeight] = mainWindow.getContentSize();
+  const msg = escapeHtml(payload.message || '');
+  const dotClass = payload.isError ? 'dot-err' : 'dot-ok';
+  const width = Math.min(380, Math.max(200, (String(payload.message || '').length * 7.5) + 56));
+  const duration = typeof payload.duration === 'number' ? Math.max(800, payload.duration) : 2800;
+  showHudCard({
+    x: Math.max(80, winWidth - width - 24),
+    y: Math.max(20, winHeight - 68),
+    width,
+    height: 46,
+    htmlPayload: `<div class="hud-pill"><span class="${dotClass}"></span><span>${msg}</span></div>`,
+    autoHideMs: duration
+  });
+});
+
+ipcMain.on('hud:show-zoom', (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return;
+  if (!mainWindow || mainWindow.isDestroyed() || layoutState.overlayBlocked) return;
+  const [winWidth] = mainWindow.getContentSize();
+  const label = escapeHtml(payload.text || 'Zoom: 100%');
+  showHudCard({
+    x: Math.max(80, winWidth - 156),
+    y: Math.max(12, (layoutState.containerRect && layoutState.containerRect.y ? layoutState.containerRect.y : 0) + 14),
+    width: 138,
+    height: 38,
+    htmlPayload: `<div class="hud-pill"><span>${label}</span></div>`,
+    autoHideMs: 1400
+  });
+});
+
+// Status, Title & Taskbar IPC
 ipcMain.on('update-tray-status', (event, state) => {
-  if (state.accountCount !== undefined) appState.accountCount = state.accountCount;
-  if (state.activeAccountName !== undefined) appState.activeAccountName = state.activeAccountName;
-  if (state.unreadCount !== undefined) {
+  if (!isTrustedSender(event) || !state || typeof state !== 'object') return;
+  if (typeof state.accountCount === 'number') appState.accountCount = state.accountCount;
+  if (typeof state.activeAccountName === 'string') appState.activeAccountName = state.activeAccountName;
+  if (typeof state.unreadCount === 'number') {
     appState.unreadCount = state.unreadCount;
-    if (app.setBadgeCount) {
+    if (typeof app.setBadgeCount === 'function') {
       try {
         app.setBadgeCount(state.unreadCount);
       } catch {}
@@ -661,39 +1974,26 @@ ipcMain.on('update-tray-status', (event, state) => {
   updateTrayMenu();
 });
 
-// IPC listener to reload the application window
-ipcMain.on('app-reload-window', () => {
-  if (mainWindow) {
+ipcMain.on('app-reload-window', (event) => {
+  if (!isTrustedSender(event)) return;
+  if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.reload();
   }
 });
 
-// IPC listener to update the window title
 ipcMain.on('update-title', (event, title) => {
-  if (mainWindow && title) {
-    mainWindow.setTitle(title);
+  if (!isTrustedSender(event) || typeof title !== 'string' || !title) return;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setTitle(title.slice(0, 200));
   }
 });
 
-// IPC listener to dynamically configure proxy for an account partition
-ipcMain.on('set-account-proxy', async (event, { partition, proxyRules }) => {
+ipcMain.on('update-taskbar-overlay', (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object' || !mainWindow || mainWindow.isDestroyed()) return;
   try {
-    if (!partition || typeof partition !== 'string' || !partition.startsWith('persist:discord_account_')) return;
-    const targetSession = session.fromPartition(partition);
-    const rules = (proxyRules || '').trim();
-    await targetSession.setProxy({ proxyRules: rules });
-    log(`Proxy configured for partition [${partition}]: ${rules || 'DIRECT'}`);
-  } catch (err) {
-    log(`Failed to set proxy for [${partition}]: ${err}`);
-  }
-});
-
-// IPC listener to update taskbar overlay icon with unread badge
-ipcMain.on('update-taskbar-overlay', (event, { count, dataUrl }) => {
-  if (!mainWindow) return;
-  try {
-    if (count > 0 && dataUrl) {
-      const img = nativeImage.createFromDataURL(dataUrl);
+    const count = Number(payload.count) || 0;
+    if (count > 0 && typeof payload.dataUrl === 'string' && payload.dataUrl.startsWith('data:image/png;base64,')) {
+      const img = nativeImage.createFromDataURL(payload.dataUrl);
       mainWindow.setOverlayIcon(img, `${count} unread mention${count > 1 ? 's' : ''}`);
     } else {
       mainWindow.setOverlayIcon(null, '');
@@ -703,70 +2003,40 @@ ipcMain.on('update-taskbar-overlay', (event, { count, dataUrl }) => {
   }
 });
 
-/**
- * Resolves the appropriate executable path and arguments for Windows login auto-start.
- * Prioritizes the installed production executable if available, or packages paths safely.
- */
+// Windows Startup & Global Shortcuts Settings
 function getStartupTarget() {
   const installedExe = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'discord-multispace', 'Discord MultiSpace.exe');
   if (app.isPackaged) {
-    return { path: process.execPath, args: [] };
+    return { path: process.execPath, args: ['--hidden'] };
   }
   if (fs.existsSync(installedExe)) {
-    return { path: installedExe, args: [] };
+    return { path: installedExe, args: ['--hidden'] };
   }
-  return { path: process.execPath, args: [`"${path.resolve(app.getAppPath())}"`] };
+  return { path: process.execPath, args: [path.resolve(app.getAppPath()), '--hidden'] };
 }
 
-/**
- * Clean up legacy or unpackaged Electron Run registry entries if they exist
- */
-function cleanLegacyStartupRegistry() {
-  if (process.platform === 'win32') {
-    try {
-      exec('reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "electron.app.Electron" /f', () => {});
-    } catch {}
-  }
-}
-
-// IPC handlers for Windows Startup item
-ipcMain.handle('get-startup-setting', () => {
+ipcMain.handle('get-startup-setting', (event) => {
+  if (!isTrustedSender(event)) return { openAtLogin: false, globalShortcutsEnabled: false };
+  let openAtLogin = false;
   try {
     const target = getStartupTarget();
-    return app.getLoginItemSettings({
-      path: target.path,
-      args: target.args,
-      name: 'Discord MultiSpace'
-    }).openAtLogin;
-  } catch {
-    return false;
-  }
-});
-
-// IPC handler for fetching remote theme CSS (bypasses CORS/CSP safely for community themes)
-ipcMain.handle('fetch-theme-css', async (event, url) => {
-  if (typeof url !== 'string' || (!url.startsWith('https://') && !url.startsWith('http://'))) {
-    return { success: false, error: 'Invalid URL' };
-  }
-  try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': CHROME_USER_AGENT
-      }
-    });
-    if (!res.ok) {
-      return { success: false, error: `HTTP ${res.status}` };
-    }
-    const css = await res.text();
-    return { success: true, css };
-  } catch (err) {
-    return { success: false, error: err.message || String(err) };
-  }
+    openAtLogin = Boolean(
+      app.getLoginItemSettings({
+        path: target.path,
+        args: target.args,
+        name: 'Discord MultiSpace'
+      }).openAtLogin
+    );
+  } catch {}
+  return {
+    openAtLogin,
+    globalShortcutsEnabled: Boolean(mainSettings.globalShortcutsEnabled)
+  };
 });
 
 ipcMain.on('set-startup-setting', (event, openAtLogin) => {
+  if (!isTrustedSender(event)) return;
   try {
-    cleanLegacyStartupRegistry();
     const target = getStartupTarget();
     app.setLoginItemSettings({
       openAtLogin: Boolean(openAtLogin),
@@ -774,322 +2044,291 @@ ipcMain.on('set-startup-setting', (event, openAtLogin) => {
       args: target.args,
       name: 'Discord MultiSpace'
     });
-    log(`Launch on startup updated: ${openAtLogin} (target: ${target.path})`);
+    log(`Launch on startup updated: ${Boolean(openAtLogin)}`);
   } catch (err) {
     log(`Failed to set startup setting: ${err}`);
   }
 });
 
-// IPC listener to clear cache for an account partition
-ipcMain.on('clear-account-cache', async (event, { partition, accountName }) => {
+ipcMain.handle('set-global-shortcuts-enabled', async (event, enabled) => {
+  if (!isTrustedSender(event)) return { ok: false };
+  mainSettings.globalShortcutsEnabled = Boolean(enabled);
+  await saveMainSettings();
+  const res = applyGlobalShortcutsSetting();
+  return { ok: true, ...res };
+});
+
+ipcMain.handle('fetch-theme-css', async (event, url) => {
+  if (!isTrustedSender(event)) {
+    return { success: false, error: 'Unauthorized sender' };
+  }
+  return safeFetchThemeCss(url, { userAgent: CHROME_USER_AGENT });
+});
+
+ipcMain.on('clear-account-cache', async (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return;
+  const { partition, accountName } = payload;
+  if (!isValidPartition(partition)) return;
   try {
-    if (!partition || typeof partition !== 'string' || !partition.startsWith('persist:discord_account_')) return;
     const targetSession = session.fromPartition(partition);
     await targetSession.clearCache();
     log(`Cache cleared successfully for partition [${partition}] (${accountName || 'Account'})`);
   } catch (err) {
-    log(`Failed to clear cache for partition [${partition}]: ${err.message || err}`);
+    log(`Failed to clear cache for partition [${partition}]: ${(err && err.message) || err}`);
   }
 });
 
-// IPC handler for opening external URLs (protocol-validated in preload, double-checked here)
 ipcMain.on('open-external-url', (event, url) => {
+  if (!isTrustedSender(event)) return;
   if (typeof url === 'string' && (url.startsWith('https://') || url.startsWith('http://'))) {
-    shell.openExternal(url);
+    shell.openExternal(url).catch(() => {});
   }
 });
 
-// Helper to broadcast selected stream audio device to all active webviews
-function broadcastAudioDeviceLabelToWebviews(label) {
-  currentStreamAudioDeviceLabel = label || 'loopback';
-  try {
-    for (const wc of webContents.getAllWebContents()) {
-      if (!wc.isDestroyed() && wc.getType() === 'webview') {
-        wc.executeJavaScript(`window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(currentStreamAudioDeviceLabel)};`).catch(() => {});
-      }
-    }
-  } catch (err) {
-    log(`Failed to broadcast audio device label: ${err}`);
-  }
-}
-
-// IPC listener to set screen share audio device
+// Screen Share Audio & Picker IPC
 ipcMain.on('set-stream-audio-device', (event, data) => {
-  const label = typeof data === 'string' ? data : (data && (data.label || data.deviceId)) || 'loopback';
+  if (!isTrustedSender(event)) return;
+  const label = typeof data === 'string'
+    ? data
+    : (data && typeof data === 'object' && (data.label || data.deviceId)) || 'loopback';
   log(`Screen share audio device set to: "${label}"`);
-  broadcastAudioDeviceLabelToWebviews(label);
+  broadcastAudioDeviceLabelToViews(label);
 });
 
-// IPC handler to get current stream audio device
-ipcMain.handle('get-stream-audio-device', () => {
-  return currentStreamAudioDeviceLabel;
+ipcMain.handle('get-stream-audio-device', (event) => {
+  if (!isTrustedSender(event)) return 'loopback';
+  return mainSettings.streamAudioDeviceLabel;
 });
 
-// IPC listener for screen picker source selection
-ipcMain.on('screen-picker-select', (event, { requestId, sourceId, withAudio, audioSourceDeviceId }) => {
-  if (audioSourceDeviceId && typeof audioSourceDeviceId === 'string') {
-    broadcastAudioDeviceLabelToWebviews(audioSourceDeviceId);
+ipcMain.on('screen-picker-select', async (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return;
+  const { requestId, sourceId, withAudio, audioSourceDeviceId } = payload;
+  const allowAudio = Boolean(withAudio);
+
+  if (typeof audioSourceDeviceId === 'string' && audioSourceDeviceId) {
+    broadcastAudioDeviceLabelToViews(audioSourceDeviceId);
   }
 
   const pending = pendingDisplayMediaRequests.get(requestId);
-  if (!pending) {
-    log(`screen-picker-select: no pending request found for [${requestId}]`);
-    return;
-  }
+  if (!pending) return;
   pendingDisplayMediaRequests.delete(requestId);
+
+  // Synchronize __discordMultiSpaceShareAudio to all views BEFORE resolving getDisplayMedia
+  await Promise.all(
+    Array.from(accountViews.values()).map((entry) => {
+      const wc = entry.view.webContents;
+      if (wc.isDestroyed()) return Promise.resolve();
+      return wc
+        .executeJavaScript(
+          `window.__discordMultiSpaceShareAudio = ${allowAudio}; window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`
+        )
+        .catch(() => {});
+    })
+  );
 
   const selectedSource = pending.sources.find((s) => s.id === sourceId);
   if (selectedSource) {
-    lastConfirmedDisplayMedia = { sourceId: selectedSource.id, withAudio: Boolean(withAudio) };
+    lastConfirmedDisplayMedia = { sourceId: selectedSource.id, withAudio: allowAudio };
     lastConfirmedTimestamp = Date.now();
-    log(`Screen share confirmed: source [${selectedSource.id}] "${selectedSource.name}", withAudio: ${Boolean(withAudio)}`);
+    log(`Screen share confirmed: source [${selectedSource.id}] "${selectedSource.name}", withAudio: ${allowAudio}`);
     try {
       pending.callback({
         video: selectedSource,
-        audio: withAudio ? 'loopback' : undefined
+        audio: allowAudio ? 'loopback' : undefined
       });
-    } catch (err) {
-      log(`Error calling display media callback: ${err.stack || err}`);
-      try {
-        pending.callback({});
-      } catch {}
+    } catch {
+      try { pending.callback({}); } catch {}
     }
   } else {
-    log(`Selected source [${sourceId}] not found in available sources`);
-    try {
-      pending.callback({});
-    } catch {}
+    try { pending.callback({}); } catch {}
   }
 });
 
-// IPC listener for screen picker cancellation
-ipcMain.on('screen-picker-cancel', (event, { requestId }) => {
-  const pending = pendingDisplayMediaRequests.get(requestId);
+ipcMain.on('screen-picker-cancel', (event, payload) => {
+  if (!isTrustedSender(event) || !payload || typeof payload !== 'object') return;
+  const pending = pendingDisplayMediaRequests.get(payload.requestId);
   if (pending) {
-    pendingDisplayMediaRequests.delete(requestId);
-    log(`Screen share cancelled by user for request [${requestId}]`);
-    try {
-      pending.callback({});
-    } catch (err) {
-      log(`Error cancelling display media callback: ${err}`);
-    }
+    pendingDisplayMediaRequests.delete(payload.requestId);
+    try { pending.callback({}); } catch {}
   }
 });
 
-/**
- * Emergency Privacy "Boss Key" Handler
- * If visible: mutes all webview audio and immediately hides window to system tray.
- * If hidden: restores window, brings it to foreground, focuses, and restores audio.
- */
-function handleBossKey() {
-  if (!mainWindow) return;
-  if (mainWindow.isVisible()) {
-    mainWindow.webContents.send('boss-key-mute-all');
-    mainWindow.hide();
-    updateTrayMenu();
-    log('Emergency Boss Key triggered: window hidden to tray & audio muted');
-  } else {
-    mainWindow.show();
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.focus();
-    mainWindow.webContents.send('boss-key-unmute-all');
-    updateTrayMenu();
-    log('Emergency Boss Key triggered: window restored & audio unmuted');
-  }
-}
-
-/**
- * Auto-Updater Setup & Life Cycle Management
- */
+// ============================================================================
+// Auto-Updater (Explicit Download & Install Prompt — Never Silent Install)
+// ============================================================================
 function setupAutoUpdater() {
-  autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
 
   autoUpdater.on('checking-for-update', () => {
     log('AutoUpdater: Checking for updates...');
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('update-checking');
-    }
+    sendToRenderer('update-checking', { manual: lastUpdateCheckManual });
   });
 
   autoUpdater.on('update-available', (info) => {
-    log(`AutoUpdater: Update available [v${info.version}]`);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('update-available', info);
-    }
+    log(`AutoUpdater: Update available [v${info && info.version}]`);
+    sendToRenderer('update-available', { ...info, manual: lastUpdateCheckManual });
   });
 
   autoUpdater.on('update-not-available', (info) => {
-    log('AutoUpdater: Update not available. Current version is up-to-date.');
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('update-not-available', info);
-    }
+    log('AutoUpdater: Update not available.');
+    sendToRenderer('update-not-available', { ...info, manual: lastUpdateCheckManual });
+    lastUpdateCheckManual = false;
   });
 
   autoUpdater.on('download-progress', (progressObj) => {
-    log(`AutoUpdater: Download progress ${Math.round(progressObj.percent)}%`);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('update-download-progress', {
-        percent: progressObj.percent,
-        bytesPerSecond: progressObj.bytesPerSecond,
-        transferred: progressObj.transferred,
-        total: progressObj.total
-      });
-    }
+    sendToRenderer('update-download-progress', {
+      percent: progressObj.percent,
+      bytesPerSecond: progressObj.bytesPerSecond,
+      transferred: progressObj.transferred,
+      total: progressObj.total
+    });
   });
 
   autoUpdater.on('update-downloaded', (info) => {
-    log(`AutoUpdater: Update downloaded successfully [v${info.version}]`);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('update-downloaded', info);
-    }
+    log(`AutoUpdater: Update downloaded [v${info && info.version}] — awaiting user install confirmation`);
+    sendToRenderer('update-downloaded', info);
   });
 
   autoUpdater.on('error', (err) => {
-    log(`AutoUpdater error: ${err.message || err}`);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('update-error', { message: err.message || String(err) });
-    }
+    log(`AutoUpdater error: ${(err && err.message) || err}`);
+    sendToRenderer('update-error', {
+      message: (err && err.message) || String(err),
+      manual: lastUpdateCheckManual
+    });
+    lastUpdateCheckManual = false;
   });
 }
 
 function triggerUpdateCheck(manual = false) {
-  log(`triggerUpdateCheck called (manual: ${manual}, isPackaged: ${app.isPackaged})`);
+  lastUpdateCheckManual = Boolean(manual);
+  log(`triggerUpdateCheck called (manual: ${lastUpdateCheckManual}, isPackaged: ${app.isPackaged})`);
+
+  if (IS_TEST_MODE) return;
+
   if (!app.isPackaged) {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('update-checking');
-    }
+    sendToRenderer('update-checking', { manual: lastUpdateCheckManual });
     const options = {
       hostname: 'api.github.com',
       path: '/repos/NextGenInfluencer/discord-multispace/releases/latest',
-      headers: { 'User-Agent': 'Discord-MultiSpace-Updater' }
+      headers: { 'User-Agent': 'Discord-MultiSpace-Updater' },
+      timeout: 6000
     };
-    https.get(options, (res) => {
+    const req = https.get(options, (res) => {
       let data = '';
-      res.on('data', chunk => { data += chunk; });
+      res.on('data', (chunk) => {
+        if (data.length < 256 * 1024) data += chunk;
+      });
       res.on('end', () => {
         try {
           const release = JSON.parse(data);
           const latestTag = (release.tag_name || '').replace(/^v/, '');
           const currentVersion = app.getVersion();
-          if (latestTag && latestTag !== currentVersion) {
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('update-available', {
-                version: latestTag,
-                releaseNotes: release.body,
-                isDev: true
-              });
-            }
+          if (latestTag && latestTag !== currentVersion && latestTag.localeCompare(currentVersion, undefined, { numeric: true }) > 0) {
+            sendToRenderer('update-available', {
+              version: latestTag,
+              releaseNotes: release.body,
+              isDev: true,
+              manual: lastUpdateCheckManual
+            });
           } else {
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('update-not-available', {
-                version: currentVersion,
-                isDev: true
-              });
-            }
+            sendToRenderer('update-not-available', {
+              version: currentVersion,
+              isDev: true,
+              manual: lastUpdateCheckManual
+            });
           }
         } catch {
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('update-not-available', { isDev: true });
-          }
+          sendToRenderer('update-not-available', { isDev: true, manual: lastUpdateCheckManual });
         }
+        lastUpdateCheckManual = false;
       });
-    }).on('error', (err) => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('update-error', { message: err.message });
-      }
+    });
+    req.on('timeout', () => {
+      req.destroy(new Error('Request timed out'));
+    });
+    req.on('error', (err) => {
+      sendToRenderer('update-error', { message: err.message, manual: lastUpdateCheckManual });
+      lastUpdateCheckManual = false;
     });
     return;
   }
 
   autoUpdater.checkForUpdates().catch((err) => {
     log(`checkForUpdates failed: ${err.message}`);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('update-error', { message: err.message });
-    }
+    sendToRenderer('update-error', { message: err.message, manual: lastUpdateCheckManual });
+    lastUpdateCheckManual = false;
   });
 }
 
-// IPC Handlers for Updater
-ipcMain.on('check-for-updates', () => {
+ipcMain.on('check-for-updates', (event) => {
+  if (!isTrustedSender(event)) return;
   triggerUpdateCheck(true);
 });
 
-ipcMain.on('install-update-now', () => {
-  log('install-update-now received: restarting and installing update');
+ipcMain.handle('updater:download', async (event) => {
+  if (!isTrustedSender(event)) return { ok: false, error: 'Unauthorized' };
+  if (!app.isPackaged) {
+    shell.openExternal('https://github.com/NextGenInfluencer/discord-multispace/releases/latest').catch(() => {});
+    return { ok: true, isDev: true };
+  }
+  try {
+    await autoUpdater.downloadUpdate();
+    return { ok: true };
+  } catch (err) {
+    sendToRenderer('update-error', { message: (err && err.message) || String(err), manual: true });
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+});
+
+ipcMain.on('install-update-now', (event) => {
+  if (!isTrustedSender(event)) return;
+  log('install-update-now confirmed by user: restarting and installing update');
+  app.isQuitting = true;
   autoUpdater.quitAndInstall(false, true);
 });
 
-ipcMain.handle('get-app-version', () => {
+ipcMain.handle('get-app-version', (event) => {
+  if (!isTrustedSender(event)) return '';
   return app.getVersion();
 });
 
-// Single application instance lock
-const gotTheLock = app.requestSingleInstanceLock();
-log(`gotTheLock: ${gotTheLock}`);
+// ============================================================================
+// Single Instance Lock & Application Boot
+// ============================================================================
+const gotTheLock = IS_TEST_MODE ? true : app.requestSingleInstanceLock();
 if (!gotTheLock) {
-  log('Could not obtain single instance lock. Quitting immediately.');
   app.quit();
 } else {
   app.on('second-instance', () => {
-    log('second-instance event received: restoring and focusing primary window');
-    if (mainWindow) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
       if (!mainWindow.isVisible()) mainWindow.show();
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.focus();
-    } else {
-      const windows = BrowserWindow.getAllWindows();
-      if (windows.length > 0) {
-        const win = windows[0];
-        if (!win.isVisible()) win.show();
-        if (win.isMinimized()) win.restore();
-        win.focus();
-      }
+      restoreFromBossKeyIfNeeded();
     }
   });
 
   app.whenReady().then(() => {
-    log('app.whenReady fired');
-    cleanLegacyStartupRegistry();
+    loadMainSettings();
     createWindow();
-    createTray();
+    if (!IS_TEST_MODE) {
+      createTray();
+    }
     setupAutoUpdater();
+    applyGlobalShortcutsSetting();
 
-    // Check for updates 6s after app launch, then every 4 hours
-    setTimeout(() => {
-      triggerUpdateCheck(false);
-    }, 6000);
-    setInterval(() => {
-      triggerUpdateCheck(false);
-    }, 4 * 60 * 60 * 1000);
-
-    // Register Global Shortcuts:
-    // Ctrl+Alt+M (Mute), Ctrl+Alt+D (Deafen), Ctrl+Shift+H (Emergency Boss Key)
-    try {
-      globalShortcut.register('CommandOrControl+Alt+M', () => {
-        if (mainWindow) {
-          mainWindow.webContents.send('trigger-global-mute-all');
-        }
-      });
-      globalShortcut.register('CommandOrControl+Alt+D', () => {
-        if (mainWindow) {
-          mainWindow.webContents.send('trigger-global-deafen-all');
-        }
-      });
-      globalShortcut.register('CommandOrControl+Shift+H', () => {
-        handleBossKey();
-      });
-      log('Global shortcuts registered: Ctrl+Alt+M (Mute), Ctrl+Alt+D (Deafen), Ctrl+Shift+H (Boss Key)');
-    } catch (err) {
-      log(`Failed to register global shortcuts: ${err}`);
+    if (!IS_TEST_MODE) {
+      setTimeout(() => triggerUpdateCheck(false), 6000);
+      setInterval(() => triggerUpdateCheck(false), 4 * 60 * 60 * 1000);
     }
 
     app.on('activate', () => {
-      log('app activate fired');
       if (BrowserWindow.getAllWindows().length === 0) {
         createWindow();
-      } else if (mainWindow) {
+      } else if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.show();
+        restoreFromBossKeyIfNeeded();
       }
     });
   });
@@ -1102,15 +2341,33 @@ app.on('before-quit', () => {
 app.on('will-quit', () => {
   try {
     globalShortcut.unregisterAll();
-    log('Global shortcuts unregistered cleanly on will-quit');
-  } catch (err) {
-    log(`Error unregistering shortcuts on will-quit: ${err}`);
-  }
+  } catch {}
 });
 
 app.on('window-all-closed', () => {
-  log('window-all-closed fired');
   if (process.platform !== 'darwin' && app.isQuitting) {
     app.quit();
   }
 });
+
+// Expose internal inspection hooks strictly in unpackaged test mode for E2E verification
+if (IS_TEST_MODE) {
+  global.__multispaceTestHooks = {
+    getMainWindow: () => mainWindow,
+    getAccountViews: () => accountViews,
+    getHudView: () => hudView,
+    getLayoutState: () => ({ ...layoutState }),
+    getMainSettings: () => ({ ...mainSettings }),
+    getAutoUpdaterConfig: () => ({
+      autoDownload: autoUpdater.autoDownload,
+      autoInstallOnAppQuit: autoUpdater.autoInstallOnAppQuit
+    }),
+    handleBossKey,
+    toggleWindow,
+    restoreFromBossKeyIfNeeded,
+    isBossKeyMuted: () => isBossKeyMuted,
+    isCustomThemeActive: () => isCustomThemeActive,
+    checkOriginPermission,
+    getLogFilePath: () => logFile
+  };
+}

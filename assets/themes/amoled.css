@@ -1,0 +1,528 @@
+/**
+ * @name         OLED Theme
+ * @description  Theme for OLED screens like AMOLED theme for phones. Nothing else.
+ * @author       dimden
+ * @version      1.9
+ * @source       https://github.com/dimdenGD/discord-oled-theme/blob/main/oled.theme.css
+ * @invite       5jm5P3SJF3
+ * @authorId     258557706892214282
+ * @website      https://dimden.dev
+ * @donate       https://dimden.dev/donate
+ */
+
+/*
+Discord OLED Theme by dimden
+
+Links:
+https://dimden.dev/
+https://github.com/dimdenGD/discord-oled-theme/
+https://discord.gg/5jm5P3SJF3
+*/
+
+:is(:root, .theme-dark) {
+	--bg-overlay-app-frame: black !important;
+	--channeltextarea-background: black !important;
+	--bg-overlay-3: black !important;
+	--bg-overlay-2: black !important;
+	--background-floating: black !important;
+	--modal-background: black !important;
+	--deprecated-store-bg: black !important;
+	--modal-footer-background: black !important;
+	--autocomplete-bg: black !important;
+}
+
+.modal-yWgWj->.inner-TkGytd>.root-SR8cQa {
+	background: black;
+	border-radius: 0px;
+	backdrop-filter: blur(5px);
+}
+
+.channelTextArea_f75fb0.channelTextArea__74017:is(> *, > * > *, > * > * > *) {
+	background: black !important;
+}
+
+.unreadBar-3t3sYc,
+.perk-19D_HN {
+	background: hsl(0 0% 4%);
+}
+
+:not(:is(.overlayBackground-1KgwVi > .scrollerBase-_bVAAt,
+		.scroller-15bIdk.thin-RnSY0a.scrollerBase-1Pkza4,
+		.scroller__83262.thin__62e51.scrollerBase__2b744,
+		.infoScroller-1QMpon.thin-RnSY0a.scrollerBase-1Pkza4,
+		.inner_a99829.scrollableContainer__74017,
+		.body__5be3e.thin_d125d2.scrollerBase_d125d2.fade_d125d2,
+		.inner_dc0b43.scrollableContainer_d0696b))::-webkit-scrollbar-track-piece {
+	background-color: black !important;
+	border: none !important;
+}
+
+.channelTextArea-rNsIhG>.webkit-HjD9Er {
+	background: black;
+	border-bottom: 4px solid black;
+}
+
+#app-mount .jumpButton-Ia2hRJ:hover,
+#app-mount .dim-1l4L4y span {
+	color: white;
+	background: black;
+}
+
+#app-mount .searchResult-9tQ1uo:after {
+	background: linear-gradient(180deg, transparent, black);
+}
+
+#app-mount .searchHeader-1l-wpR,
+#app-mount .focused-2bY0OD,
+#app-mount .focused-1Yu0L3 {
+	background: black;
+	background-attachment: fixed;
+}
+
+#app-mount .searchHeader-1l-wpR .tab-2Ixsn0.selected-16te-P,
+#app-mount .searchHeader-1l-wpR .tab-2Ixsn0:hover {
+	color: black;
+	border-color: black;
+}
+
+.templatesList-2E6rTe,
+.content-1LAB8Z {
+	margin: 0 !important;
+	border-radius: 0 !important;
+}
+
+:is(.autocomplete-1vrmpx,
+	.tierBody-x9kBBp,
+	.overflowRolesPopout-140n9i,
+	.container__927fc,
+	.layout-2DM8Md,
+	.header-1TKi98,
+	.footer-2gL1pp,
+	.scrollerBase-289Jih,
+	.root-1gCeng,
+	.uploadModal-2ifh8j,
+	.selected-1Tbx07,
+	.outer-1AjyKL,
+	.theme-dark .outer-1AjyKL.active-1xchHY, .theme-dark .outer-1AjyKL.interactive-3B9GmY:hover,
+	.invite-18yqGF,
+	.notice-1tZwqv,
+	.notice-2FJMB4,
+	.notice-2X5hT5,
+	*[class^='ready'],
+	*[class^='categoryHeader'],
+	.inner-MADQqc,
+	.headerTop-3C2Zn0,
+	.footer-1fjuF6,
+	.scrollableContainer-2NUZem,
+	.activityUserPopout-2yItg2,
+	.header-QKLPzZ,
+	.activityProfile-2bJRaP,
+	.tabBarContainer-1s1u-z,
+	.inner-1ilYF7,
+	.uploadModal-2ifh8j,
+	.modalSize-3WSXDU.root-1CAIjD.fullscreenOnMobile-2971EC.rootWithShadow-2hdL2J,
+	.footer-3mqk7D,
+	div[role="list"]:not(:is([aria-label*="role"], [aria-label*='Role'])),
+	div[role="listitem"]:not(:is([class*="role"], [class*='Role'])),
+	.autocomplete-1vrmpx,
+	.section-2gLsgF,
+	.peopleColumn-29fq28,
+	.header-2mZ9Ov,
+	.verticalFit-waKLYN,
+	.hoverablePayment-Yc6mK7,
+	.bottomDivider-1K9Gao,
+	.expandedInfo-3kfShd,
+	.codeRedemptionRedirect-1wVR4b,
+	.categoryHeader-O1zU94,
+	.searchOption-zQ-1l6::after,
+	.option-96V44q::after,
+	.activity-1ythUs,
+	.container-1eFT6O,
+	.headerTop-2cWpdB,
+	.footer-1N3bR3,
+	.headerTop-547GTz,
+	.nameTagNoCustomStatus-3IWmZC,
+	.nameTag-ECvD8P,
+	.nameTag-m8r81H,
+	.tabBarContainer-37hZsr,
+	.content-1OG56Q.body-1HULZ8.thin-RnSY0a.scrollerBase-1Pkza4,
+	/* keep nitro */
+	.root_a28985.small__05f7b.fullscreenOnMobile__96797.rootWithShadow__073a7,
+	/* add payment options, logout */
+	.flex-2S1XBF.flex-3BkGQD.horizontalReverse-60Katr.horizontalReverse-2QssvL.flex-3BkGQD.directionRowReverse-HZatnx.justifyBetween-wAERV6.alignCenter-14kD11.noWrap-hBpHBz.footer-IubaaS.footerSeparator-3U8YsT,
+	.breadcrumb.wrapper-wOVKdL,
+	.content-1OG56Q.body-2qXItL.thin-RnSY0a.scrollerBase-1Pkza4,
+	/* nitro re subscribe */
+	.flex-2S1XBF.flex-3BkGQD.horizontalReverse-60Katr.horizontalReverse-2QssvL.flex-3BkGQD.directionRowReverse-HZatnx.justifyStart-2Mwniq.alignCenter-14kD11.noWrap-hBpHBz.footer-IubaaS.footerSeparator-3U8YsT,
+	.textScroller-dc9_kz,
+	.boostContainer-RzXAwu,
+	/* pending cancellation */
+	.content-1OG56Q.thin-RnSY0a.scrollerBase-1Pkza4,
+	/* notification settings screen */
+	.aboutMeSection---MkQa,
+	.headerTop-3vNv-a,
+	.rolesList-1geHY1,
+	.bodyTitle-1ySSKn.base-1x0h_U.size12-3cLvbJ.muted-3-7c5L.uppercase-3VWUQ9,
+	.footer-3UKYOU,
+	.scrollableContainer-15eg7h,
+	.menu-1QACrS,
+	.autocomplete-3NRXG8.autocomplete-3jLKbj.autocompleteAttached-bt_md-,
+	.scroller,
+	.appDetailsContainer_cb32c7.appDetailsRowContainer_cb32c7,
+	.noiseCancellationPopout-iRK2A0,
+	.perksModalContentWrapper-2HU6uL,
+	.perksModalContentWrapper-3RHugb,
+	.giftAction-ACtHBA.button-f2h6uQ.lookFilled-yCfaCM.colorPrimary-2AuQVo.sizeSmall-wU2dO-.grow-2sR_-F,
+	.templatesList-2E6rTe,
+	.container-UC8Ug1,
+	#app-mount .searchResultsContainer-1ma_dc,
+	#app-mount .popout-13LQ_3,
+	.menu-3sdvDG,
+	.message-G6O-Wv,
+	#app-mount .calendarPicker-2yf6Ci .react-datepicker__header,
+	#app-mount .calendarPicker-2yf6Ci .react-datepicker,
+	#app-mount .searchResultsWrap-2DKFzt,
+	#app-mount .calendarPicker-2yf6Ci .react-datepicker__day--disabled,
+	#app-mount .calendarPicker-2yf6Ci .react-datepicker__day--outside-month,
+	#app-mount .quickMessage-1yeL4E,
+	#app-mount .searchOption-8nCYo-.selected-1r_nkg,
+	#app-mount .searchBar-1MOL6S,
+	.searchResult-9tQ1uo.expanded-w_LCGl,
+	#app-mount .searchResult-9tQ1uo .searchResultMessage-1fxgXh.hit-1fVM9e,
+	#app-mount .searchResult-9tQ1uo:before,
+	#app-mount .channelSeparator-1DOiGt .channelName-1JRO3C,
+	#app-mount .option-96V44q.selected-rZcOL-,
+	#app-mount .searchAnswer-3Dz2-q,
+	#app-mount .searchFilter-2ESiM3,
+	#app-mount .container-3ayLPN,
+	.searchResultsWrap-3-pOjs,
+	.searchResult-9tQ1uo.expanded-ovgtuV,
+	.userPopout-3XzG_A,
+	.wrapper-2aW0bm > .button-1ZiXG9:hover,
+	.justifyStart-2Mwniq.alignStretch-Uwowzr.noWrap-hBpHBz.footer-31IekZ.footerSeparator-VzAYwb,
+	.topSectionPlaying-1J5E4n,
+	.topSection-y3p-_D > header,
+	.bodyTitle-1ySSKn,
+	.rolesList-1geHY1,
+	.bodyInnerWrapper-26fQXj,
+	.headerTop-3GPUSF,
+	.body-2wLx-E.thin-31rlnD.scrollerBase-_bVAAt,
+	.activityUserPopout-2MzGCj.activity-1gTu-L.newPopoutActivityStyles,
+	h3.bodyTitle-2Az3VQ.fontDisplay-3Gtuks.base-21yXnu.size12-oc4dx4.muted-eZM05q.uppercase-2unHJn,
+	.footer-3naVBw,
+	.note-Go5ZP2,
+	.bodyInnerWrapper-2bQs1k,
+	.topSection-13QKHs,
+	.thin-31rlnD.scrollerBase-_bVAAt.fade-1R6FHN,
+	.popoutInfo-16MuYF,
+	.scroller-nxCRu_.thin-RnSY0a.scrollerBase-1Pkza4,
+	.paymentPane-ut5qKZ.verticalFit-21XL0v,
+	.paymentRow-1HKOLu.bottomDivider-ZmTm-j,
+	.pageActions-1crTQL,
+	#app-mount .container-ZMc96U.themed-Hp1KC_,
+	.wrapper-1NNaWG.categoryHeader-OpJ1Ly,
+	.scrollableContainer__33e06.themedBackground__6b1b6.webkit__8d35a,
+	/* type box */
+	.channelTextArea_c2094b.channelTextArea__648e5,
+	/* events */
+	.focusLock__10aa5 > .root_a28985 > *,
+	.blockedPaymentsWarning__0bf12.blockedPaymentsWarning_de6c61.card__4dc22,
+	/* blocked payments warning */
+	.scroller-2MALzE.list-2u03C-.thin-31rlnD.scrollerBase-_bVAAt,
+	.listRow-hutiT_, .connectedAccounts-2-XP1G,
+	.theme-light .footerSeparator-VzAYwb,
+	code.scrollbarGhostHairline-2LpzZ9.scrollbar-3vVt8d.hljs,
+	.focusLock-2tveLW > div,
+	div.content-1SgpWY > div.chat-2ZfjoI > div > div.container-3wLKDe,
+	div[class^="emojiSection"],
+	div[class^="guildSection"],
+	.messageContainer-3VTXBC,
+	.scroller-3j5xK2,
+	.browser-mnQ1T7.container-18GwIk,
+	.header-3_zmOb,
+	.container-2rzKKA,
+	/* section: emoji picker */
+	.wrapper-1NNaWG.header-1ULbqO,
+	.scroller_cc9b9a.thin_b1c063.scrollerBase_dc3aa9,
+	.scroller_e89578.list__0870a.thin_b1c063.scrollerBase_dc3aa9,
+	.wrapper__7a35f.categoryHeader_f97a5f,
+	.flex_f5fbb7.horizontalReverse_dc209c.justifyStart__42744.alignStretch_e239ef.noWrap__5c413.footer__89240.modalFooter__6a783.footerSeparator__57d95,
+	.scroller__750f5.thin_b1c063.scrollerBase_dc3aa9,
+	.app_b1f720 > *,
+	.scroller__1f4dd.auto_a48086.scrollerBase_dc3aa9,
+	.contentWrapper-3vHNP2,
+	.scroller-2MALzE.list-obNEuP.none-2-_0dP.scrollerBase-_bVAAt,
+	.inspector-DFKXwB,
+	.unicodeShortcut-3N8oDe,
+	.pageWrapper__582b9,
+	/* shop */
+	.inner-1NoIT5.thin-31rlnD.scrollerBase-_bVAAt,
+	.guildIcon-2SUGiq,
+	.categoryItemRecentEmoji-Rk8CU1,
+	.container-nwU-8G,
+	.emojiPicker-6YCk8a,
+	.header-11eigE,
+	.scroller-2MALzE.none-1rXy4P.scrollerBase-1Pkza4,
+	.pageWrapper-2PwDoS,
+	.contentWrapper-2f9yME,
+	/* slash commands as "/" */
+	.scroller_e89578.list__0870a.thin__62e51.scrollerBase__2b744,
+	/* home -> nitro (billing paused) */
+	.homeWrapperNormal__6f127.homeWrapper__59a03,
+	/* settings -> billing -> payments warning */
+	.blockedPaymentsWarning__0bf12.card__4dc22,
+	/* settings -> billing -> payments table header */
+	.paymentPane__9cf01.verticalFit_d9ac53,
+	/* right click on server channel */
+	.scroller__750f5.thin__62e51.scrollerBase__2b744,
+	/* create a server -> already have an invite title */
+	.flex_f5fbb7.horizontalReverse_dc209c.justifyStart__42744.alignStretch_e239ef.noWrap__5c413.footer__89240,
+	/* discovery */
+	.scroller__1f4dd.auto__76cc7.scrollerBase__2b744,
+	/* mentions (@ in chat box) */
+	.scroller__3fc84.thin__62e51.scrollerBase__65223,
+
+
+	.scroller-2MALzE.list-2u03C-.thin-RnSY0a.scrollerBase-1Pkza4,
+
+	/* section: follow channel */
+	.root-1CAIjD.small-2xUY-3.fullscreenOnMobile-2971EC.rootWithShadow-2hdL2J,
+	.popout_5708,
+	.option-Uc12mm,
+
+
+	/* section: sticker picker */
+	.wrapper-1NNaWG.packHeader-w9jpYl,
+	.standardStickerShortcut-ObSns3,
+	.assetWrapperMasked-1iw9lV,
+	.picker-20lcBA,
+	/* soundboard */
+	.pageBody-23bo4p,
+	/* browse channels */
+	.grid-1aWVsE,
+	/* embed in pinned */
+
+	/* section tenor gifs */
+	.searchBar-3aIzc-.container-2oNtJn.medium-2NClDM,
+	div.layers-OrUESM.layers-1YQhyW > div > div.container-1eFtFS > div > div > div.chat-2ZfjoI.background-fkKrXt > div > div,
+	/* create category & channel */
+	.flex-2S1XBF.flex-3BkGQD.horizontal-112GEH.horizontal-1Piu5-.flex-3BkGQD.directionRow-2Iu2A9.justifyStart-2Mwniq.alignCenter-14kD11.noWrap-hBpHBz.header-1ffhsl,
+	.content-1OG56Q.modalContent-33IoUE.thin-RnSY0a.scrollerBase-1Pkza4,
+
+	.directoryContainer-z-0pgp.thin-RnSY0a.scrollerBase-1Pkza4,
+	/*app directory*/
+	.flex-2S1XBF.flex-3BkGQD.horizontalReverse-60Katr.horizontalReverse-2QssvL.flex-3BkGQD.directionRowReverse-HZatnx.justifyStart-2Mwniq.alignStretch-Uwowzr.noWrap-hBpHBz.footer-31IekZ.bd-error-modal-footer.footerSeparator-VzAYwb,
+	.peopleColumn-1wMU14) {
+	background: black !important;
+}
+
+textarea[aria-label="Note"] {
+	background-color: hsla(0 0% 0% / 0.3) !important;
+}
+
+.card-FDVird:before,
+.wrapper-2tAnRe,
+.total-i6us2n,
+.users-3kndPl,
+.total-i6us2n:after {
+	border-right-color: hsl(0 0% 4%);
+	background: hsl(0 0% 4%) !important;
+}
+
+.container-2rzKKA {
+	border-color: hsl(0 0% 4%);
+}
+
+.container-2rzKKA:hover {
+	border-color: hsl(0 0% 8%);
+}
+
+.inner-1ilYF7,
+.selected-1Tbx07,
+.selected-1Tbx07>.autocompleteRowContent-1AMstF,
+.selected-1Tbx07>.autocompleteRowContent-1AMstF>.autocompleteRowContentPrimary-238PvP,
+.selected-1Tbx07>.autocompleteRowContent-1AMstF>.autocompleteRowContentPrimary-238PvP>.colorInteractiveActive-3Ip9Eu {
+	background-color: hsl(0 0% 7%) !important;
+	border-radius: 3px;
+}
+
+:is(.selected-1Tbx07>.content-Qb0rXO,
+	.option_be8b2e[aria-selected='true'], .selected-3H3-RC) {
+	background-color: hsl(0 0% 7%) !important;
+}
+
+.stickerInspected-mwnU6w .inspectedIndicator-27zwNZ {
+	background: hsl(0 0% 6%) !important;
+}
+
+/* section: pinned messages */
+.header-1w9Q93,
+.messagesPopout-eVzQcI.thin-RnSY0a.scrollerBase-1Pkza4,
+.messageGroupCozy-3v_RqN.wrapper-30-Nkg.cozy-VmLDNB.zalgo-26OfGz,
+.footer-5ji8u1 {
+	background: black;
+}
+
+.messageGroupWrapper-1jf_7C {
+	border: none;
+}
+
+:is(.expandedFolderBackground-1cujaW,
+	.jumpToPresentBar-9P20AM,
+	.rowContainer-3t7486 .spoilerText-3p6IlD,
+	.emojiItemSelected-2Lg50V) {
+	background-color: hsl(0 0% 8%) !important;
+}
+
+.repliedMessage-VokQwo:before {
+	border-color: hsl(0 0% 6%) !important;
+}
+
+.embedWrapper-lXpS3L {
+	background-color: hsl(0 0% 2%);
+}
+
+.messageContent-2qWWxC>code {
+	background-color: hsl(0 0% 4%);
+}
+
+.inner-1ilYF7,
+.userPopout-xaxa6l {
+	border: 1px hsl(0 0% 7%) solid;
+}
+
+.headerText-3Uvj1Y {
+	background-color: transparent !important;
+}
+
+.container-3JKcAb>.spine--Wla_O,
+.svg.spine-29OFwR {
+	color: hsl(0 0% 27%) !important;
+}
+
+.markup-eYLPri code.inline {
+	background-color: hsl(0 0% 5%);
+}
+
+:is(.defaultColor-HXu-5n,
+	.text-md-medium-2avxhQ,
+	.text-md-normal-304U3g,
+	.sampleLink-5BWNy9,
+	.text-md-bold-22PzaZ.text-PdAsFQ,
+	.skip-2hTIXL) {
+	color: white !important;
+}
+
+/* section: create a server */
+.container__73245 {
+	background-color: black;
+	color: white;
+}
+
+.footerButton-24QPis.button-ejjZWC.lookFilled-1H2Jvj.colorPrimary-2-Lusz.sizeMedium-2oH5mg.grow-2T4nbg {
+	background: hsl(0 0% 5%);
+}
+
+div:has(h1.defaultColor-1EVLSt.heading-xl-semibold-3E1dYv.defaultColor-1GKx81:is(.title-1_TkpU, .title-1LqMUp, .title-OdeD-o))> :is(h1, :nth-child(2)) {
+	color: white;
+}
+
+.container-x8Y1ix>* {
+	color: inherit;
+}
+
+
+.container-1Lk8p7 {
+	background: black;
+}
+
+.examplesForm-N_P087>*:nth-child(n+2) {
+	color: white;
+}
+
+.flex-2S1XBF.flex-3BkGQD.horizontalReverse-60Katr.horizontalReverse-2QssvL.flex-3BkGQD.directionRowReverse-HZatnx:is(.justifyStart-2Mwniq, .justifyBetween-wAERV6).alignStretch-Uwowzr.noWrap-hBpHBz:is(.footer-3ie9JP, .footer-3_2BuU, .footer-IubaaS).footerSeparator-3U8YsT {
+	background: black;
+}
+
+.defaultColor-1EVLSt.heading-lg-semibold-14ouVv.defaultColor-1GKx81.footerTitle-3Bslxi {
+	color: white;
+}
+
+.input-2g-os5 {
+	background-color: hsl(0 0% 8%) !important;
+	color: white !important;
+}
+
+.rowContainer-3t7486 div.rowText-3MQqQi {
+	color: gray;
+}
+
+.container-x8Y1ix:hover {
+	transform: scale(1.01);
+}
+
+.footerButton-24QPis.button-f2h6uQ.lookFilled-yCfaCM.colorPrimary-2AuQVo.sizeMedium-2bFIHr.grow-2sR_-F {
+	background-color: var(--background-modifier-hover) !important;
+}
+
+.footerSeparator-VzAYwb {
+	box-shadow: none !important;
+	-webkit-box-shadow: none !important;
+}
+
+.search-25t1e9 .searchBox-31Zv9h {
+	background-color: var(--input-background);
+}
+
+/* Reduces the server navigation header/banner to compensate with the colored scrollbar area. */
+div.container-1-ERn5 {
+	width: 232px;
+}
+
+/* For some reason this specific Vencord element is being clipped. This somewhat fixes the problem. */
+#vc-membercount {
+	margin-bottom: 0 !important;
+}
+
+:is(:root, .theme-dark) {
+	--background-primary: black !important;
+	--background-secondary: black !important;
+	--background-tertiary: black !important;
+	--background-secondary-alt: black !important;
+	--background-accent: black !important;
+	--button-secondary-background: hsl(0 0% 10%) !important;
+	--activity-card-background: black;
+	--home-background: black !important;
+}
+
+
+:root, .theme-dark, .theme-midnight, html, body {
+  --background-primary: #000000 !important;
+  --background-secondary: #000000 !important;
+  --background-secondary-alt: #050505 !important;
+  --background-tertiary: #000000 !important;
+  --background-accent: #111111 !important;
+  --background-floating: #0a0a0a !important;
+  --background-mobile-primary: #000000 !important;
+  --background-mobile-secondary: #050505 !important;
+  --channeltextarea-background: #0d0d0d !important;
+  --input-background: #0d0d0d !important;
+  --bg-base-primary: #000000 !important;
+  --bg-base-secondary: #000000 !important;
+  --bg-base-tertiary: #050505 !important;
+  --modal-background: #050505 !important;
+  --modal-footer-background: #000000 !important;
+  --activity-card-background: #000000 !important;
+  --home-background: #000000 !important;
+}
+
+nav[aria-label="Servers sidebar"],
+div[class*="sidebar_"],
+div[class*="chat_"],
+div[class*="chatContent_"],
+div[class*="container_"],
+main[class*="chatContent_"],
+section[class*="panels_"],
+form[class*="form_"] {
+  background-color: #000000 !important;
+}

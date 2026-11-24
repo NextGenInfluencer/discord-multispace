@@ -1,0 +1,353 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const {
+  isValidAccountId,
+  isValidPartition,
+  accountIdFromPartition,
+  partitionForAccountId,
+  redactSensitiveUrl,
+  parseAndValidateProxy,
+  isPrivateOrReservedIP,
+  validateHttpsPublicUrl,
+  safeFetchThemeCss,
+  transformDiscordCspHeader,
+  isTrustedDiscordOrigin,
+  classifyNavigationUrl,
+  classifyPopupRequest,
+  matchAudioInputDevice,
+  computePaneBounds,
+  parseDiscordTitleUnread
+} = require('../lib/security');
+
+const ROOT_DIR = path.resolve(__dirname, '..');
+
+test('Account ID and Partition strict validation', () => {
+  assert.equal(isValidAccountId('1'), true);
+  assert.equal(isValidAccountId('acc_123-XYZ'), true);
+  assert.equal(isValidAccountId('a'.repeat(64)), true);
+
+  // Boundary & attack rejections
+  assert.equal(isValidAccountId(''), false);
+  assert.equal(isValidAccountId(null), false);
+  assert.equal(isValidAccountId(undefined), false);
+  assert.equal(isValidAccountId(123), false);
+  assert.equal(isValidAccountId('a'.repeat(65)), false);
+  assert.equal(isValidAccountId('../etc/passwd'), false);
+  assert.equal(isValidAccountId('acc/../2'), false);
+  assert.equal(isValidAccountId('acc 1'), false);
+  assert.equal(isValidAccountId('acc:1'), false);
+
+  assert.equal(isValidPartition('persist:discord_account_1'), true);
+  assert.equal(isValidPartition('persist:discord_account_work_01'), true);
+  assert.equal(isValidPartition('persist:discord_account_'), false);
+  assert.equal(isValidPartition('persist:discord_account_../evil'), false);
+  assert.equal(isValidPartition('discord_account_1'), false);
+  assert.equal(accountIdFromPartition('persist:discord_account_abc123'), 'abc123');
+  assert.equal(accountIdFromPartition('persist:discord_account_../bad'), null);
+  assert.equal(partitionForAccountId('42'), 'persist:discord_account_42');
+  assert.throws(() => partitionForAccountId('../bad'));
+});
+
+test('Proxy parsing, credential stripping, fail-closed validation, and log redaction', () => {
+  // Direct / empty cases
+  for (const empty of ['', '   ', null, undefined]) {
+    const res = parseAndValidateProxy(empty);
+    assert.equal(res.valid, true);
+    assert.equal(res.mode, 'direct');
+    assert.equal(res.proxyRules, '');
+    assert.equal(res.auth, null);
+  }
+
+  // Standard HTTP / SOCKS5 / bare host:port
+  const httpSimple = parseAndValidateProxy('http://198.51.100.5:8080');
+  assert.equal(httpSimple.valid, true);
+  assert.equal(httpSimple.proxyRules, 'http://198.51.100.5:8080');
+  assert.equal(httpSimple.auth, null);
+
+  const bareHost = parseAndValidateProxy('127.0.0.1:8888');
+  assert.equal(bareHost.valid, true);
+  assert.equal(bareHost.proxyRules, 'http://127.0.0.1:8888');
+
+  const socks = parseAndValidateProxy('socks5://127.0.0.1:1080');
+  assert.equal(socks.valid, true);
+  assert.equal(socks.proxyRules, 'socks5://127.0.0.1:1080');
+
+  // Default ports 80 / 443
+  const http80 = parseAndValidateProxy('http://proxy.example.com:80');
+  assert.equal(http80.valid, true);
+  assert.equal(http80.proxyRules, 'http://proxy.example.com:80');
+
+  // Authenticated HTTP proxy: strips credentials from proxyRules and extracts decoded auth
+  const authed = parseAndValidateProxy('http://alice:s3cr%40t%3Apass@203.0.113.9:3128');
+  assert.equal(authed.valid, true);
+  assert.equal(authed.proxyRules, 'http://203.0.113.9:3128');
+  assert.deepEqual(authed.auth, { username: 'alice', password: 's3cr@t:pass' });
+  assert.equal(authed.redacted, 'http://***:***@203.0.113.9:3128');
+  assert.equal(authed.redacted.includes('s3cr'), false);
+
+  // Authenticated SOCKS5 must be explicitly rejected (Chromium networking limitation)
+  const socksAuthed = parseAndValidateProxy('socks5://user:pass@127.0.0.1:1080');
+  assert.equal(socksAuthed.valid, false);
+  assert.match(socksAuthed.error, /SOCKS/i);
+
+  // Proxy-list injection & malformed inputs must fail closed
+  for (const bad of [
+    'not a url',
+    'http://1.2.3.4:8080,direct://',
+    'http://1.2.3.4:8080;https://direct',
+    'ftp://1.2.3.4:21',
+    'socks5://127.0.0.1',
+    'http://1.2.3.4:99999',
+    'http://1.2.3.4:8080/pac.js',
+    'http://1.2.3.4:8080?bypass=1'
+  ]) {
+    const r = parseAndValidateProxy(bad);
+    assert.equal(r.valid, false, `Expected invalid proxy for: ${bad}`);
+  }
+
+  // Redaction utility
+  assert.equal(
+    redactSensitiveUrl('Proxy failed for https://bob:mySecret123@proxy.host:8443/test'),
+    'Proxy failed for https://***:***@proxy.host:8443/test'
+  );
+});
+
+test('SSRF IPv4 and IPv6 private, loopback, metadata, and NAT64/mapped blocking', () => {
+  const blockedIps = [
+    '',
+    'not-an-ip',
+    '0.0.0.0',
+    '127.0.0.1',
+    '127.255.255.254',
+    '10.0.0.1',
+    '10.255.255.255',
+    '100.64.0.1',
+    '100.127.255.254',
+    '169.254.169.254',
+    '172.16.0.1',
+    '172.31.255.254',
+    '192.168.0.1',
+    '192.168.255.254',
+    '224.0.0.1',
+    '255.255.255.255',
+    '::',
+    '::1',
+    'fc00::1',
+    'fd12:3456:789a::1',
+    'fe80::1',
+    'fe80::1%eth0',
+    'ff02::1',
+    '2001:db8::1',
+    '::ffff:127.0.0.1',
+    '::ffff:10.0.0.1',
+    '::ffff:169.254.169.254',
+    '::ffff:192.168.1.1',
+    '64:ff9b::127.0.0.1',
+    '2002:7f00:0001::1'
+  ];
+
+  for (const ip of blockedIps) {
+    assert.equal(isPrivateOrReservedIP(ip), true, `Expected ${ip} to be blocked`);
+  }
+
+  const publicIps = [
+    '1.1.1.1',
+    '8.8.8.8',
+    '172.15.255.255',
+    '172.32.0.1',
+    '100.63.255.255',
+    '100.128.0.1',
+    '::ffff:8.8.8.8',
+    '2606:4700:4700::1111',
+    '2001:4860:4860::8888'
+  ];
+
+  for (const ip of publicIps) {
+    assert.equal(isPrivateOrReservedIP(ip), false, `Expected ${ip} to be allowed as public`);
+  }
+});
+
+test('safeFetchThemeCss enforces HTTPS, blocks SSRF redirects, caps size at 1MB, and resolves safe @imports', async () => {
+  const publicLookup = async () => [{ address: '93.184.216.34', family: 4 }];
+  const privateLookup = async () => [{ address: '127.0.0.1', family: 4 }];
+
+  // 1. Cleartext HTTP rejected
+  const httpRes = await safeFetchThemeCss('http://example.com/theme.css', { lookupFn: publicLookup });
+  assert.equal(httpRes.success, false);
+  assert.match(httpRes.error, /HTTPS/i);
+
+  // 2. Localhost & private DNS rejected
+  const localRes = await safeFetchThemeCss('https://localhost/theme.css', { lookupFn: publicLookup });
+  assert.equal(localRes.success, false);
+
+  const dnsRebindRes = await safeFetchThemeCss('https://theme.example.com/a.css', { lookupFn: privateLookup });
+  assert.equal(dnsRebindRes.success, false);
+  assert.match(dnsRebindRes.error, /private|loopback/i);
+
+  // 3. 302 Redirect to loopback IP blocked!
+  const redirectRes = await safeFetchThemeCss('https://theme.example.com/start.css', {
+    lookupFn: publicLookup,
+    fetchFn: async () => ({
+      status: 302,
+      ok: false,
+      headers: new Map([['location', 'https://127.0.0.1/internal.css']])
+    })
+  });
+  assert.equal(redirectRes.success, false);
+  assert.match(redirectRes.error, /private|loopback/i);
+
+  // 4. Oversized (> 1 MB) stylesheet blocked!
+  const hugeCss = 'body { color: red; }\n'.repeat(60000); // > 1.2 MB
+  const sizeRes = await safeFetchThemeCss('https://theme.example.com/huge.css', {
+    lookupFn: publicLookup,
+    maxBytes: 1024 * 1024,
+    fetchFn: async () => ({
+      status: 200,
+      ok: true,
+      headers: new Map(),
+      text: async () => hugeCss
+    })
+  });
+  assert.equal(sizeRes.success, false);
+  assert.match(sizeRes.error, /maximum size limit/i);
+
+  // 5. Valid HTTPS theme with relative @import resolved cleanly
+  const validRes = await safeFetchThemeCss('https://theme.example.com/dir/main.css', {
+    lookupFn: publicLookup,
+    fetchFn: async (url) => {
+      if (url === 'https://theme.example.com/dir/main.css') {
+        return {
+          status: 200,
+          ok: true,
+          headers: new Map(),
+          text: async () => '@import url("./sub.css");\n.main { background: #000; }'
+        };
+      }
+      if (url === 'https://theme.example.com/dir/sub.css') {
+        return {
+          status: 200,
+          ok: true,
+          headers: new Map(),
+          text: async () => '.sub { color: #fff; }'
+        };
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    }
+  });
+  assert.equal(validRes.success, true);
+  assert.match(validRes.css, /\.sub \{ color: #fff; \}/);
+  assert.match(validRes.css, /\.main \{ background: #000; \}/);
+});
+
+test('Discord CSP header preservation — connect-src and script-src are NEVER weakened', () => {
+  const sampleDiscordCsp =
+    "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' https://cdn.discordapp.com; font-src 'self'; connect-src 'self' https://discord.com wss://gateway.discord.gg";
+
+  // Default / Minimalist: 100% untouched byte-for-byte
+  assert.equal(transformDiscordCspHeader(sampleDiscordCsp, false), sampleDiscordCsp);
+
+  // Active custom theme: connect-src and script-src remain untouched, no wildcard '*'
+  const relaxed = transformDiscordCspHeader(sampleDiscordCsp, true);
+  assert.match(relaxed, /connect-src 'self' https:\/\/discord\.com wss:\/\/gateway\.discord\.gg/);
+  assert.match(relaxed, /script-src 'self' 'unsafe-inline'/);
+  assert.equal(relaxed.includes('connect-src *'), false);
+  assert.equal(relaxed.includes('style-src *'), false);
+  assert.match(relaxed, /style-src 'self' 'unsafe-inline' https: data: blob:/);
+});
+
+test('Origin, navigation, redirect, and popup classification guards', () => {
+  assert.equal(isTrustedDiscordOrigin('https://discord.com/app'), true);
+  assert.equal(isTrustedDiscordOrigin('https://ptb.discord.com/channels/@me'), true);
+  assert.equal(isTrustedDiscordOrigin('http://discord.com/app'), false);
+  assert.equal(isTrustedDiscordOrigin('https://discord.com.evil.org/app'), false);
+  assert.equal(isTrustedDiscordOrigin('https://youtube.com/embed/xyz'), false);
+  assert.equal(isTrustedDiscordOrigin('https://12345.discordsays.com/'), false);
+
+  assert.deepEqual(classifyNavigationUrl('https://discord.com/login'), { allow: true, openExternal: false });
+  assert.deepEqual(classifyNavigationUrl('http://discord.com/login'), { allow: false, openExternal: true });
+  assert.deepEqual(classifyNavigationUrl('https://cdn.discordapp.com/attachments/1/2/a.html'), { allow: false, openExternal: true });
+  assert.deepEqual(classifyNavigationUrl('https://github.com/NextGenInfluencer'), { allow: false, openExternal: true });
+  assert.deepEqual(classifyNavigationUrl('file:///C:/Windows/win.ini'), { allow: false, openExternal: false });
+  assert.deepEqual(classifyNavigationUrl('javascript:alert(1)'), { allow: false, openExternal: false });
+  assert.deepEqual(classifyNavigationUrl('data:text/html,<h1>x</h1>'), { allow: false, openExternal: false });
+
+  assert.deepEqual(classifyPopupRequest({ url: 'about:blank', disposition: 'new-window' }), { action: 'allow-popout' });
+  assert.deepEqual(classifyPopupRequest({ url: 'https://discord.com/oauth2/authorize?client_id=123', disposition: 'foreground-tab' }), { action: 'allow-oauth' });
+  assert.deepEqual(classifyPopupRequest({ url: 'https://example.com', disposition: 'foreground-tab' }), { action: 'external', url: 'https://example.com/' });
+  assert.deepEqual(classifyPopupRequest({ url: 'javascript:void(0)' }), { action: 'deny' });
+});
+
+test('Audio input device matcher prioritizes exact hardware devices over Default alias', () => {
+  const devices = [
+    { kind: 'audioinput', deviceId: 'default', label: 'Default - Desktop Microphone (Realtek Audio)' },
+    { kind: 'audioinput', deviceId: 'communications', label: 'Communications - Desktop Microphone (Realtek Audio)' },
+    { kind: 'audioinput', deviceId: 'hw-mic-1', label: 'Desktop Microphone (Realtek Audio)' },
+    { kind: 'audioinput', deviceId: 'hw-b2', label: 'Voicemeeter Out B2 (VB-Audio Voicemeeter VAIO)' }
+  ];
+
+  const matchedMic = matchAudioInputDevice(devices, 'Desktop Microphone (Realtek Audio)');
+  assert.equal(matchedMic.deviceId, 'hw-mic-1');
+
+  const matchedB2 = matchAudioInputDevice(devices, 'Voicemeeter Out B2');
+  assert.equal(matchedB2.deviceId, 'hw-b2');
+
+  assert.equal(matchAudioInputDevice(devices, 'loopback'), null);
+  assert.equal(matchAudioInputDevice(devices, ''), null);
+});
+
+test('WebContentsView bounds calculation and Discord unread title parser', () => {
+  const single = computePaneBounds({ x: 72, y: 0, width: 1208, height: 800 }, { isSplitView: false });
+  assert.deepEqual(single, {
+    primary: { x: 72, y: 0, width: 1208, height: 800 },
+    secondary: null
+  });
+
+  const split = computePaneBounds({ x: 72, y: 38, width: 1208, height: 762 }, { isSplitView: true, dividerPx: 2 });
+  assert.deepEqual(split, {
+    primary: { x: 72, y: 38, width: 603, height: 762 },
+    secondary: { x: 677, y: 38, width: 603, height: 762 }
+  });
+
+  const minimized = computePaneBounds({ x: -10, y: -10, width: -100, height: -50 }, { isSplitView: true });
+  assert.equal(minimized.primary.width, 0);
+  assert.equal(minimized.secondary.width, 0);
+
+  assert.equal(parseDiscordTitleUnread('(4) Discord | #general'), '4');
+  assert.equal(parseDiscordTitleUnread('(142) Discord | Friends'), '99+');
+  assert.equal(parseDiscordTitleUnread('• Discord | #dev'), '•');
+  assert.equal(parseDiscordTitleUnread('(*) Discord'), '•');
+  assert.equal(parseDiscordTitleUnread('Discord | Friends'), null);
+  assert.equal(parseDiscordTitleUnread(''), null);
+});
+
+test('Repository PII, bundled offline assets, CSP, and packaging hygiene checks', () => {
+  const vbs = fs.readFileSync(path.join(ROOT_DIR, 'launch-silent.vbs'), 'utf8');
+  assert.equal(/Users\\lefte/i.test(vbs), false, 'launch-silent.vbs must not contain developer path PII');
+
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT_DIR, 'package.json'), 'utf8'));
+  for (const excluded of ['launch-silent.vbs', 'launch.bat', 'setup.bat', 'create-shortcut.js']) {
+    assert.equal(pkg.build.files.includes(excluded), false, `${excluded} must not be bundled in app.asar`);
+  }
+  assert.equal(pkg.build.artifactName, 'Discord-MultiSpace-Setup-${version}.${ext}');
+  assert.equal(pkg.build.win.icon, 'assets/icon.ico');
+
+  const html = fs.readFileSync(path.join(ROOT_DIR, 'index.html'), 'utf8');
+  assert.equal(html.includes('fonts.googleapis.com'), false, 'index.html must not ping Google Fonts');
+  assert.equal(html.includes('<webview'), false, 'index.html must not use legacy <webview>');
+  assert.equal(html.includes('20.317 4.37'), false, 'index.html must not embed trademarked Clyde logo path');
+
+  const midnight = fs.readFileSync(path.join(ROOT_DIR, 'assets', 'themes', 'midnight.css'), 'utf8');
+  const amoled = fs.readFileSync(path.join(ROOT_DIR, 'assets', 'themes', 'amoled.css'), 'utf8');
+  assert.ok(midnight.length > 50000);
+  assert.ok(amoled.length > 10000);
+  assert.equal(/@import\s+url\(/i.test(midnight), false, 'midnight.css must have external @imports stripped');
+  assert.equal(/@import\s+url\(/i.test(amoled), false, 'amoled.css must have code.css inlined');
+
+  assert.ok(fs.statSync(path.join(ROOT_DIR, 'assets', 'icon.ico')).size > 20000);
+  assert.ok(fs.statSync(path.join(ROOT_DIR, 'tray-icon.png')).size > 1000);
+});

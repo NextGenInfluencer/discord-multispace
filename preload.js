@@ -2,19 +2,18 @@
  * Discord MultiSpace — Preload Script (Context Bridge)
  *
  * Exposes a minimal, validated API surface from the main process to the
- * renderer via contextBridge. The renderer can ONLY call the methods
+ * shell renderer via contextBridge. The renderer can ONLY call the methods
  * listed here — it has no access to require(), ipcRenderer, shell, or
  * any other Node.js / Electron API directly.
  */
 
 const { contextBridge, ipcRenderer } = require('electron');
 
-// Whitelist of IPC channels the renderer is allowed to send on
+// Whitelist of IPC channels the renderer is allowed to send on (one-way)
 const ALLOWED_SEND_CHANNELS = [
   'update-tray-status',
   'update-taskbar-overlay',
   'update-title',
-  'set-account-proxy',
   'app-reload-window',
   'clear-account-cache',
   'set-startup-setting',
@@ -22,25 +21,47 @@ const ALLOWED_SEND_CHANNELS = [
   'screen-picker-cancel',
   'check-for-updates',
   'install-update-now',
-  'set-stream-audio-device'
+  'set-stream-audio-device',
+  'views:reload-account',
+  'views:set-zoom',
+  'views:retry-account',
+  'hud:show-tooltip',
+  'hud:show-toast',
+  'hud:show-zoom'
 ];
 
 // Whitelist of IPC channels the renderer is allowed to invoke (request/response)
 const ALLOWED_INVOKE_CHANNELS = [
   'get-startup-setting',
+  'set-global-shortcuts-enabled',
   'fetch-theme-css',
   'get-app-version',
-  'get-stream-audio-device'
+  'get-stream-audio-device',
+  'views:sync-accounts',
+  'views:validate-proxy',
+  'views:update-account-proxy',
+  'views:remove-account',
+  'views:set-layout',
+  'views:set-overlay-blocked',
+  'views:apply-theme',
+  'views:set-mute-all',
+  'views:set-deafen-all',
+  'views:check-hibernation',
+  'updater:download'
 ];
 
 // Whitelist of IPC channels the renderer is allowed to listen on
 const ALLOWED_RECEIVE_CHANNELS = [
-  'webview-zoom-action',
+  'view:loading-state',
+  'view:did-fail-load',
+  'view:did-recover-load',
+  'view:notification-updated',
+  'view:zoom-changed',
+  'shortcut:switch-account-index',
+  'shortcut:cycle-account',
   'tray-reload-session',
   'trigger-global-mute-all',
   'trigger-global-deafen-all',
-  'boss-key-mute-all',
-  'boss-key-unmute-all',
   'open-screen-picker',
   'cancel-screen-picker',
   'update-checking',
@@ -75,11 +96,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   /**
    * Subscribe to messages from the main process.
-   * Returns an unsubscribe function for cleanup.
+   * Strips raw IpcRendererEvent and returns an unsubscribe function.
    */
   on(channel, callback) {
-    if (ALLOWED_RECEIVE_CHANNELS.includes(channel)) {
-      const handler = (event, ...args) => callback(...args);
+    if (ALLOWED_RECEIVE_CHANNELS.includes(channel) && typeof callback === 'function') {
+      const handler = (_event, ...args) => callback(...args);
       ipcRenderer.on(channel, handler);
       return () => ipcRenderer.removeListener(channel, handler);
     }

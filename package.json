@@ -1,10 +1,13 @@
 {
   "name": "discord-multispace",
-  "version": "1.1.9",
+  "version": "2.0.0",
   "description": "Production-grade, lightweight multi-account Discord desktop client powered by Electron",
   "main": "main.js",
   "scripts": {
+    "postinstall": "node node_modules/electron/install.js",
     "start": "electron .",
+    "test": "node --test tests/*.test.js",
+    "test:e2e": "electron tests/e2e-electron.js",
     "make-shortcut": "node create-shortcut.js",
     "build": "electron-builder --win nsis",
     "dist": "electron-builder"
@@ -12,7 +15,9 @@
   "build": {
     "appId": "com.nextgeninfluencer.discordmultispace",
     "productName": "Discord MultiSpace",
+    "artifactName": "Discord-MultiSpace-Setup-${version}.${ext}",
     "win": {
+      "icon": "assets/icon.ico",
       "target": [
         "nsis"
       ]
@@ -37,11 +42,10 @@
       "renderer.js",
       "index.html",
       "style.css",
+      "lib/**/*",
+      "assets/**/*",
       "tray-icon.png",
       "tray-icon.svg",
-      "create-shortcut.js",
-      "launch-silent.vbs",
-      "launch.bat",
       "package.json"
     ],
     "directories": {
@@ -57,10 +61,13 @@
   "author": "NextGenInfluencer",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^34.2.0",
-    "electron-builder": "^25.1.8"
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0"
   },
   "dependencies": {
-    "electron-updater": "^6.8.9"
+    "electron-updater": "^6.8.11"
+  },
+  "overrides": {
+    "minimatch": "^11.0.9"
   }
 }
