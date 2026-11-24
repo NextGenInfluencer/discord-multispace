@@ -2,6 +2,8 @@ const {
   app,
   BrowserWindow,
   WebContentsView,
+  webContents,
+  screen,
   shell,
   session,
   Tray,
@@ -29,7 +31,8 @@ const {
   classifyPopupRequest,
   matchAudioInputDevice,
   computePaneBounds,
-  parseDiscordTitleUnread
+  parseDiscordTitleUnread,
+  sanitizeWindowState
 } = require('./lib/security');
 
 app.setName('Discord MultiSpace');
@@ -58,8 +61,16 @@ const appState = {
 // Persistent main-process preferences (stored in userData/settings.json)
 let mainSettings = {
   globalShortcutsEnabled: false,
-  streamAudioDeviceLabel: 'loopback'
+  streamAudioDeviceLabel: 'loopback',
+  windowState: {
+    width: 1280,
+    height: 800,
+    isMaximized: false
+  }
 };
+let windowStateSaveTimer = null;
+let pendingMaximizeOnFirstShow = false;
+let settingsWriteQueue = Promise.resolve();
 
 // Account WebContentsViews: accountId -> entry
 const accountViews = new Map();
@@ -94,9 +105,13 @@ let globalDeafenedState = false;
 const pendingDisplayMediaRequests = new Map();
 let lastConfirmedDisplayMedia = null;
 let lastConfirmedTimestamp = 0;
+let lastShareAudioPreference = true;
 
 // Updater state
 let lastUpdateCheckManual = false;
+let isExplicitDownloadInFlight = false;
+let errorEmittedDuringDownload = false;
+let updateDownloadedReady = false;
 
 // ============================================================================
 // Non-Blocking Async Rotating Logger
@@ -160,11 +175,20 @@ function loadMainSettings() {
     if (fs.existsSync(file)) {
       const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
       if (parsed && typeof parsed === 'object') {
+        const ws = parsed.windowState && typeof parsed.windowState === 'object' ? parsed.windowState : {};
         mainSettings = {
           globalShortcutsEnabled: Boolean(parsed.globalShortcutsEnabled),
           streamAudioDeviceLabel: typeof parsed.streamAudioDeviceLabel === 'string' && parsed.streamAudioDeviceLabel
             ? parsed.streamAudioDeviceLabel
-            : 'loopback'
+            : 'loopback',
+          windowState: {
+            ...(Number.isFinite(ws.x) && Number.isFinite(ws.y)
+              ? { x: Math.round(ws.x), y: Math.round(ws.y) }
+              : {}),
+            width: Number.isFinite(ws.width) && ws.width >= 100 ? Math.round(ws.width) : 1280,
+            height: Number.isFinite(ws.height) && ws.height >= 100 ? Math.round(ws.height) : 800,
+            isMaximized: Boolean(ws.isMaximized)
+          }
         };
       }
     }
@@ -173,12 +197,75 @@ function loadMainSettings() {
   }
 }
 
-async function saveMainSettings() {
+function saveMainSettings() {
+  const snapshot = JSON.stringify(mainSettings, null, 2);
+  settingsWriteQueue = settingsWriteQueue
+    .then(() => fs.promises.writeFile(getSettingsFilePath(), snapshot, 'utf8'))
+    .catch((err) => {
+      log(`Failed to save settings.json: ${err}`);
+    });
+  return settingsWriteQueue;
+}
+
+function saveMainSettingsSync() {
+  clearTimeout(windowStateSaveTimer);
+  windowStateSaveTimer = null;
   try {
-    await fs.promises.writeFile(getSettingsFilePath(), JSON.stringify(mainSettings, null, 2), 'utf8');
+    fs.writeFileSync(getSettingsFilePath(), JSON.stringify(mainSettings, null, 2), 'utf8');
   } catch (err) {
-    log(`Failed to save settings.json: ${err}`);
+    log(`Failed to save settings.json synchronously: ${err}`);
   }
+}
+
+function captureCurrentWindowState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const isMax = mainWindow.isMaximized() || pendingMaximizeOnFirstShow;
+  const isMin = mainWindow.isMinimized();
+  const isFull = mainWindow.isFullScreen();
+
+  let nextBounds = mainSettings.windowState || { width: 1280, height: 800 };
+  if (!isMax && !isMin && !isFull) {
+    const b = mainWindow.getBounds();
+    if (b && b.width >= 200 && b.height >= 200) {
+      nextBounds = {
+        x: Math.round(b.x),
+        y: Math.round(b.y),
+        width: Math.round(b.width),
+        height: Math.round(b.height)
+      };
+    }
+  } else if (typeof mainWindow.getNormalBounds === 'function' && (!nextBounds || !Number.isFinite(nextBounds.x))) {
+    try {
+      const nb = mainWindow.getNormalBounds();
+      if (nb && nb.width >= 200 && nb.height >= 200 && nb.x > -20000 && nb.y > -20000) {
+        nextBounds = {
+          x: Math.round(nb.x),
+          y: Math.round(nb.y),
+          width: Math.round(nb.width),
+          height: Math.round(nb.height)
+        };
+      }
+    } catch {}
+  }
+
+  mainSettings.windowState = {
+    ...(Number.isFinite(nextBounds.x) && Number.isFinite(nextBounds.y)
+      ? { x: nextBounds.x, y: nextBounds.y }
+      : {}),
+    width: Number.isFinite(nextBounds.width) && nextBounds.width >= 200 ? nextBounds.width : 1280,
+    height: Number.isFinite(nextBounds.height) && nextBounds.height >= 200 ? nextBounds.height : 800,
+    isMaximized: Boolean(isMax)
+  };
+}
+
+function scheduleWindowStateSave() {
+  captureCurrentWindowState();
+  clearTimeout(windowStateSaveTimer);
+  windowStateSaveTimer = setTimeout(() => {
+    windowStateSaveTimer = null;
+    captureCurrentWindowState();
+    saveMainSettings();
+  }, 250);
 }
 
 // ============================================================================
@@ -216,26 +303,148 @@ function sendToRenderer(channel, payload) {
 // ============================================================================
 // Screen-Share Display Media Request Handler
 // ============================================================================
-async function handleDisplayMediaRequest(request, callback) {
+function resolveDisplayMediaOwner(request, targetSession) {
+  let ownerWc = null;
+  if (request && request.frame && webContents && typeof webContents.fromFrame === 'function') {
+    try {
+      ownerWc = webContents.fromFrame(request.frame) || null;
+    } catch {}
+  }
+
+  let ownerAccountId = null;
+  for (const [accId, entry] of accountViews.entries()) {
+    const entryWc = entry.view.webContents;
+    if (ownerWc) {
+      if (entryWc === ownerWc) {
+        ownerAccountId = accId;
+        break;
+      }
+      if (entry.childWindows) {
+        for (const cw of entry.childWindows) {
+          if (cw && !cw.isDestroyed() && cw.webContents === ownerWc) {
+            ownerAccountId = accId;
+            break;
+          }
+        }
+        if (ownerAccountId) break;
+      }
+    } else if (targetSession && !entryWc.isDestroyed() && entryWc.session === targetSession) {
+      ownerAccountId = accId;
+      ownerWc = entryWc;
+      break;
+    }
+  }
+
+  return { ownerWc, ownerAccountId };
+}
+
+function cancelPendingDisplayMediaRequests(predicate, reason = 'cancelled') {
+  let cancelledCount = 0;
+  for (const [reqId, pending] of Array.from(pendingDisplayMediaRequests.entries())) {
+    if (!predicate(pending, reqId)) continue;
+    pendingDisplayMediaRequests.delete(reqId);
+    cancelledCount += 1;
+    log(`Cancelling pending display media request [${reqId}] (${reason})`);
+    try {
+      pending.callback({});
+    } catch {}
+    sendToRenderer('cancel-screen-picker', { requestId: reqId });
+  }
+  return cancelledCount;
+}
+
+function cancelPendingDisplayMediaForAccount(accountId, reason = 'account-changed') {
+  if (!isValidAccountId(accountId)) return 0;
+  const entry = accountViews.get(accountId);
+  let targetSes = null;
+  try {
+    targetSes = session.fromPartition(partitionForAccountId(accountId));
+  } catch {}
+
+  if (
+    lastConfirmedDisplayMedia &&
+    (lastConfirmedDisplayMedia.accountId === accountId ||
+      (targetSes && lastConfirmedDisplayMedia.targetSession === targetSes))
+  ) {
+    lastConfirmedDisplayMedia = null;
+    lastConfirmedTimestamp = 0;
+  }
+
+  return cancelPendingDisplayMediaRequests((pending) => {
+    if (pending.ownerAccountId === accountId) return true;
+    if (targetSes && pending.targetSession === targetSes) return true;
+    if (entry) {
+      if (pending.ownerWc && pending.ownerWc === entry.view.webContents) return true;
+      if (entry.childWindows) {
+        for (const cw of entry.childWindows) {
+          if (cw && !cw.isDestroyed() && pending.ownerWc === cw.webContents) return true;
+        }
+      }
+    }
+    return false;
+  }, reason);
+}
+
+async function handleDisplayMediaRequest(request, callback, targetSession = null) {
   try {
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    log(`Handling display media request [${requestId}] from origin: ${request.securityOrigin || 'unknown'}`);
+    const { ownerWc, ownerAccountId } = resolveDisplayMediaOwner(request, targetSession);
+    log(`Handling display media request [${requestId}] from origin: ${(request && request.securityOrigin) || 'unknown'} (account: ${ownerAccountId || 'unknown'})`);
 
-    const sources = await desktopCapturer.getSources({
-      types: ['screen', 'window'],
-      fetchWindowIcons: true,
-      thumbnailSize: { width: 360, height: 202 }
-    });
+    let abortedDuringCapture = false;
+    const markAborted = () => {
+      abortedDuringCapture = true;
+    };
+    const onMainNav = (details) => {
+      if (details && details.isMainFrame && !details.isSameDocument) {
+        abortedDuringCapture = true;
+      }
+    };
+    if (ownerWc && !ownerWc.isDestroyed()) {
+      ownerWc.once('destroyed', markAborted);
+      ownerWc.once('render-process-gone', markAborted);
+      ownerWc.on('did-start-navigation', onMainNav);
+    }
+
+    let sources;
+    try {
+      sources = await desktopCapturer.getSources({
+        types: ['screen', 'window'],
+        fetchWindowIcons: true,
+        thumbnailSize: { width: 360, height: 202 }
+      });
+    } finally {
+      if (ownerWc && !ownerWc.isDestroyed()) {
+        ownerWc.removeListener('destroyed', markAborted);
+        ownerWc.removeListener('render-process-gone', markAborted);
+        ownerWc.removeListener('did-start-navigation', onMainNav);
+      }
+    }
+
+    if (
+      abortedDuringCapture ||
+      (ownerWc && ownerWc.isDestroyed()) ||
+      (ownerAccountId && !accountViews.has(ownerAccountId))
+    ) {
+      log(`Aborting display media request [${requestId}] — requesting view reloaded or closed during source enumeration`);
+      callback({});
+      return;
+    }
 
     if (!sources || sources.length === 0) {
       callback({});
       return;
     }
 
-    // Deduplicate Discord's rapid secondary getDisplayMedia probe within 2s —
+    // Deduplicate Discord's rapid secondary getDisplayMedia probe within 2s (scoped to the same account session!) —
     // NEVER fall back to sources[0] (primary monitor) if the chosen window closed!
     const now = Date.now();
-    if (lastConfirmedDisplayMedia && (now - lastConfirmedTimestamp) < 2000) {
+    const sameConfirmedSession = Boolean(
+      lastConfirmedDisplayMedia &&
+      (!lastConfirmedDisplayMedia.targetSession || !targetSession || lastConfirmedDisplayMedia.targetSession === targetSession) &&
+      (!lastConfirmedDisplayMedia.accountId || !ownerAccountId || lastConfirmedDisplayMedia.accountId === ownerAccountId)
+    );
+    if (lastConfirmedDisplayMedia && sameConfirmedSession && (now - lastConfirmedTimestamp) < 2000) {
       const matchingSource = sources.find((s) => s.id === lastConfirmedDisplayMedia.sourceId);
       if (matchingSource) {
         log(`Auto-fulfilling secondary display media request [${requestId}] with confirmed source [${matchingSource.id}]`);
@@ -259,7 +468,14 @@ async function handleDisplayMediaRequest(request, callback) {
       pendingDisplayMediaRequests.delete(oldId);
     }
 
-    pendingDisplayMediaRequests.set(requestId, { callback, sources, request });
+    pendingDisplayMediaRequests.set(requestId, {
+      callback,
+      sources,
+      request,
+      ownerWc,
+      ownerAccountId,
+      targetSession
+    });
 
     const serializedSources = sources
       .filter((s) => s.id.startsWith('screen:') || (s.name && s.name.trim() !== ''))
@@ -282,10 +498,12 @@ async function handleDisplayMediaRequest(request, callback) {
       });
 
     if (mainWindow && !mainWindow.isDestroyed()) {
-      if (!mainWindow.isVisible()) {
-        mainWindow.show();
+      if (!IS_TEST_MODE) {
+        if (!mainWindow.isVisible()) {
+          mainWindow.show();
+        }
+        mainWindow.focus();
       }
-      mainWindow.focus();
       sendToRenderer('open-screen-picker', { requestId, sources: serializedSources });
     } else {
       callback({});
@@ -405,7 +623,7 @@ function setupSession(targetSession) {
 
   if (typeof targetSession.setDisplayMediaRequestHandler === 'function') {
     targetSession.setDisplayMediaRequestHandler((request, callback) => {
-      handleDisplayMediaRequest(request, callback);
+      handleDisplayMediaRequest(request, callback, targetSession);
     });
   }
 
@@ -604,6 +822,26 @@ function broadcastAudioDeviceLabelToViews(label) {
   }
 }
 
+async function syncScreenShareAudioStateToViews(allowAudio) {
+  lastShareAudioPreference = Boolean(allowAudio);
+  const script = `window.__discordMultiSpaceShareAudio = ${lastShareAudioPreference}; window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`;
+  const tasks = [];
+  for (const entry of accountViews.values()) {
+    const wc = entry.view.webContents;
+    if (wc && !wc.isDestroyed()) {
+      tasks.push(wc.executeJavaScript(script).catch(() => {}));
+    }
+    if (entry.childWindows) {
+      for (const childWin of entry.childWindows) {
+        if (childWin && !childWin.isDestroyed() && !childWin._isOAuthPopup && !childWin.webContents.isDestroyed()) {
+          tasks.push(childWin.webContents.executeJavaScript(script).catch(() => {}));
+        }
+      }
+    }
+  }
+  await Promise.all(tasks);
+}
+
 // ============================================================================
 // Proxy Session Configuration (Fail-Closed & Awaited Before Any Load)
 // ============================================================================
@@ -722,7 +960,11 @@ function focusActiveDiscordViewOrShell() {
 }
 
 function createHudView() {
-  if (!mainWindow || mainWindow.isDestroyed() || hudView) return;
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (hudView && !hudView.webContents.isDestroyed()) {
+    mainWindow.contentView.addChildView(hudView);
+    return;
+  }
   hudView = new WebContentsView({
     webPreferences: {
       nodeIntegration: false,
@@ -990,15 +1232,16 @@ function attachNavigationAndShortcutHandlers(entry) {
   wc.on('did-create-window', (childWin, createDetails) => {
     const isOAuth = classifyPopupRequest(createDetails).action === 'allow-oauth';
     childWin._isOAuthPopup = isOAuth;
+    const childWc = childWin.webContents;
     if (entry.childWindows) {
       entry.childWindows.add(childWin);
       childWin.on('closed', () => {
         entry.childWindows.delete(childWin);
         childWindowsHiddenByBossKey.delete(childWin);
+        cancelPendingDisplayMediaRequests((p) => p.ownerWc === childWc, 'popout-window-closed');
       });
     }
 
-    const childWc = childWin.webContents;
     childWc.setWebRTCIPHandlingPolicy(entry.hasProxy ? 'disable_non_proxied_udp' : 'default');
     if (isBossKeyMuted || globalDeafenedState) {
       childWc.setAudioMuted(true);
@@ -1037,15 +1280,31 @@ function attachNavigationAndShortcutHandlers(entry) {
     childWc.on('will-navigate', enforceChildNavGuard);
     childWc.on('will-redirect', enforceChildNavGuard);
 
+    childWc.on('did-start-navigation', (details) => {
+      if (details.isMainFrame && !details.isSameDocument) {
+        cancelPendingDisplayMediaRequests((p) => p.ownerWc === childWc, 'popout-window-navigated');
+      }
+    });
+    childWc.on('render-process-gone', () => {
+      cancelPendingDisplayMediaRequests((p) => p.ownerWc === childWc, 'popout-render-gone');
+    });
+    childWc.on('destroyed', () => {
+      cancelPendingDisplayMediaRequests((p) => p.ownerWc === childWc, 'popout-webcontents-destroyed');
+    });
+
     if (!isOAuth) {
       attachContextMenu(childWc);
-      childWc.on('dom-ready', () => {
+      const injectChildBridges = () => {
         if (childWc.isDestroyed()) return;
         childWc.executeJavaScript(DISCORD_MEDIA_AUDIO_PATCH).catch(() => {});
         childWc.executeJavaScript(
-          `window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`
+          `window.__discordMultiSpaceShareAudio = ${Boolean(lastShareAudioPreference)}; window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`
         ).catch(() => {});
-      });
+      };
+      injectChildBridges();
+      childWc.on('dom-ready', injectChildBridges);
+      childWc.on('did-navigate', injectChildBridges);
+      childWc.on('did-navigate-in-page', injectChildBridges);
     }
   });
 
@@ -1164,7 +1423,7 @@ async function ensureAccountView(account) {
       if (wc.isDestroyed()) return;
       wc.executeJavaScript(DISCORD_MEDIA_AUDIO_PATCH).catch(() => {});
       wc.executeJavaScript(
-        `window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`
+        `window.__discordMultiSpaceShareAudio = ${Boolean(lastShareAudioPreference)}; window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`
       ).catch(() => {});
     };
 
@@ -1179,9 +1438,20 @@ async function ensureAccountView(account) {
     });
 
     wc.on('did-start-navigation', (details) => {
+      if (details.isMainFrame && !details.isSameDocument) {
+        cancelPendingDisplayMediaRequests((p) => p.ownerWc === wc || p.ownerAccountId === accountId, 'account-main-navigation');
+      }
       if (details.isMainFrame && details.url && !details.url.startsWith('chrome-error:')) {
         entry.pendingMainLoadFailed = false;
       }
+    });
+
+    wc.on('render-process-gone', () => {
+      cancelPendingDisplayMediaRequests((p) => p.ownerWc === wc || p.ownerAccountId === accountId, 'account-render-gone');
+    });
+
+    wc.on('destroyed', () => {
+      cancelPendingDisplayMediaRequests((p) => p.ownerWc === wc || p.ownerAccountId === accountId, 'account-webcontents-destroyed');
     });
 
     wc.on('did-fail-load', (_event, errorCode, errorDescription, _validatedURL, isMainFrame) => {
@@ -1345,6 +1615,7 @@ function layoutViews() {
 }
 
 function reloadAccountView(accountId, ignoreCache = false) {
+  cancelPendingDisplayMediaForAccount(accountId, 'account-reload');
   const entry = accountViews.get(accountId);
   if (!entry || entry.view.webContents.isDestroyed()) return;
   entry.pendingMainLoadFailed = false;
@@ -1365,6 +1636,7 @@ function reloadAccountView(accountId, ignoreCache = false) {
 }
 
 async function destroyAccountView(accountId, wipeSessionData = true) {
+  cancelPendingDisplayMediaForAccount(accountId, 'account-removed');
   const entry = accountViews.get(accountId);
   if (entry) {
     if (entry.childWindows) {
@@ -1529,14 +1801,25 @@ function resolveAppIconPath() {
 function createWindow() {
   setupSession(session.defaultSession);
 
-  mainWindow = new BrowserWindow({
+  const displays = (screen && typeof screen.getAllDisplays === 'function') ? screen.getAllDisplays() : [];
+  const restored = sanitizeWindowState(mainSettings.windowState, displays, {
     width: 1280,
     height: 800,
     minWidth: 940,
+    minHeight: 560
+  });
+  const hasRestoredCoords = Number.isFinite(restored.x) && Number.isFinite(restored.y);
+  const shouldShowImmediately = !START_HIDDEN && !IS_TEST_MODE;
+  pendingMaximizeOnFirstShow = !shouldShowImmediately && Boolean(restored.isMaximized);
+
+  mainWindow = new BrowserWindow({
+    ...(hasRestoredCoords ? { x: restored.x, y: restored.y } : { center: true }),
+    width: restored.width,
+    height: restored.height,
+    minWidth: 940,
     minHeight: 560,
-    center: true,
     backgroundColor: '#1e1f22',
-    show: !START_HIDDEN && !IS_TEST_MODE,
+    show: false,
     autoHideMenuBar: true,
     title: 'Discord MultiSpace',
     icon: resolveAppIconPath(),
@@ -1553,6 +1836,11 @@ function createWindow() {
   // Electron 45 console-message details object signature
   mainWindow.webContents.on('console-message', ({ level, message, lineNumber }) => {
     log(`[RENDERER:${level || 'info'}] (${lineNumber || 0}) ${message}`);
+  });
+
+  // Cancel any orphaned displayMedia callbacks if the shell window itself reloads
+  mainWindow.webContents.on('did-start-loading', () => {
+    cancelPendingDisplayMediaRequests(() => true, 'shell-reload');
   });
 
   // Shell index.html must never navigate or redirect to any external or local file URL
@@ -1592,23 +1880,49 @@ function createWindow() {
     log(`Failed to load index.html: ${err}`);
   });
 
-  if (!START_HIDDEN && !IS_TEST_MODE) {
-    mainWindow.center();
+  if (shouldShowImmediately) {
+    if (!hasRestoredCoords) {
+      mainWindow.center();
+    }
+    if (restored.isMaximized) {
+      mainWindow.maximize();
+    }
     mainWindow.show();
     mainWindow.focus();
   } else {
     log(`Window started hidden (START_HIDDEN=${START_HIDDEN}, IS_TEST_MODE=${IS_TEST_MODE})`);
   }
 
+  mainWindow.on('resize', scheduleWindowStateSave);
+  mainWindow.on('move', scheduleWindowStateSave);
+  mainWindow.on('maximize', () => {
+    pendingMaximizeOnFirstShow = false;
+    scheduleWindowStateSave();
+  });
+  mainWindow.on('unmaximize', () => {
+    pendingMaximizeOnFirstShow = false;
+    scheduleWindowStateSave();
+  });
+
   mainWindow.on('close', (event) => {
+    captureCurrentWindowState();
     if (!app.isQuitting) {
+      saveMainSettings();
       event.preventDefault();
       mainWindow.hide();
       updateTrayMenu();
+    } else {
+      saveMainSettingsSync();
     }
   });
 
   mainWindow.on('show', () => {
+    if (pendingMaximizeOnFirstShow) {
+      pendingMaximizeOnFirstShow = false;
+      try {
+        mainWindow.maximize();
+      } catch {}
+    }
     restoreFromBossKeyIfNeeded();
     updateTrayMenu();
     layoutViews();
@@ -1791,6 +2105,7 @@ ipcMain.handle('views:update-account-proxy', async (event, payload) => {
   }
 
   const res = await configureAccountSessionProxy(accountId, normalizedProxy);
+  cancelPendingDisplayMediaForAccount(accountId, 'proxy-updated');
   const entry = accountViews.get(accountId);
   if (entry && !entry.view.webContents.isDestroyed()) {
     entry.appliedProxyRaw = normalizedProxy;
@@ -2368,22 +2683,17 @@ ipcMain.on('screen-picker-select', async (event, payload) => {
   if (!pending) return;
   pendingDisplayMediaRequests.delete(requestId);
 
-  // Synchronize __discordMultiSpaceShareAudio to all views BEFORE resolving getDisplayMedia
-  await Promise.all(
-    Array.from(accountViews.values()).map((entry) => {
-      const wc = entry.view.webContents;
-      if (wc.isDestroyed()) return Promise.resolve();
-      return wc
-        .executeJavaScript(
-          `window.__discordMultiSpaceShareAudio = ${allowAudio}; window.__discordMultiSpaceAudioDeviceLabel = ${JSON.stringify(mainSettings.streamAudioDeviceLabel)};`
-        )
-        .catch(() => {});
-    })
-  );
+  // Synchronize __discordMultiSpaceShareAudio to all views AND non-OAuth pop-out call windows BEFORE resolving getDisplayMedia
+  await syncScreenShareAudioStateToViews(allowAudio);
 
   const selectedSource = pending.sources.find((s) => s.id === sourceId);
   if (selectedSource) {
-    lastConfirmedDisplayMedia = { sourceId: selectedSource.id, withAudio: allowAudio };
+    lastConfirmedDisplayMedia = {
+      sourceId: selectedSource.id,
+      withAudio: allowAudio,
+      accountId: pending.ownerAccountId || null,
+      targetSession: pending.targetSession || null
+    };
     lastConfirmedTimestamp = Date.now();
     log(`Screen share confirmed: source [${selectedSource.id}] "${selectedSource.name}", withAudio: ${allowAudio}`);
     try {
@@ -2441,21 +2751,26 @@ function setupAutoUpdater() {
   });
 
   autoUpdater.on('update-downloaded', (info) => {
+    updateDownloadedReady = true;
     log(`AutoUpdater: Update downloaded [v${info && info.version}] — awaiting user install confirmation`);
     sendToRenderer('update-downloaded', info);
   });
 
   autoUpdater.on('error', (err) => {
     log(`AutoUpdater error: ${(err && err.message) || err}`);
+    if (isExplicitDownloadInFlight) {
+      errorEmittedDuringDownload = true;
+    }
     sendToRenderer('update-error', {
       message: (err && err.message) || String(err),
-      manual: lastUpdateCheckManual
+      manual: lastUpdateCheckManual || isExplicitDownloadInFlight
     });
     lastUpdateCheckManual = false;
   });
 }
 
 function triggerUpdateCheck(manual = false) {
+  if (!manual && updateDownloadedReady) return;
   lastUpdateCheckManual = Boolean(manual);
   log(`triggerUpdateCheck called (manual: ${lastUpdateCheckManual}, isPackaged: ${app.isPackaged})`);
 
@@ -2523,16 +2838,26 @@ ipcMain.on('check-for-updates', (event) => {
 
 ipcMain.handle('updater:download', async (event) => {
   if (!isTrustedSender(event)) return { ok: false, error: 'Unauthorized' };
+  if (IS_TEST_MODE) {
+    return { ok: true, isTest: true };
+  }
   if (!app.isPackaged) {
     shell.openExternal('https://github.com/NextGenInfluencer/discord-multispace/releases/latest').catch(() => {});
     return { ok: true, isDev: true };
   }
+  isExplicitDownloadInFlight = true;
+  errorEmittedDuringDownload = false;
   try {
     await autoUpdater.downloadUpdate();
     return { ok: true };
   } catch (err) {
-    sendToRenderer('update-error', { message: (err && err.message) || String(err), manual: true });
+    if (!errorEmittedDuringDownload) {
+      sendToRenderer('update-error', { message: (err && err.message) || String(err), manual: true });
+    }
     return { ok: false, error: (err && err.message) || String(err) };
+  } finally {
+    isExplicitDownloadInFlight = false;
+    errorEmittedDuringDownload = false;
   }
 });
 
@@ -2594,6 +2919,8 @@ if (!gotTheLock) {
 
 app.on('before-quit', () => {
   app.isQuitting = true;
+  captureCurrentWindowState();
+  saveMainSettingsSync();
 });
 
 app.on('will-quit', () => {
@@ -2615,7 +2942,15 @@ if (IS_TEST_MODE) {
     getAccountViews: () => accountViews,
     getHudView: () => hudView,
     getLayoutState: () => ({ ...layoutState }),
-    getMainSettings: () => ({ ...mainSettings }),
+    getMainSettings: () => JSON.parse(JSON.stringify(mainSettings)),
+    getSettingsFilePath,
+    loadMainSettings,
+    captureCurrentWindowState,
+    saveMainSettingsSync,
+    createWindow,
+    getPendingDisplayMediaRequests: () => pendingDisplayMediaRequests,
+    handleDisplayMediaRequest,
+    cancelPendingDisplayMediaForAccount,
     getAutoUpdaterConfig: () => ({
       autoDownload: autoUpdater.autoDownload,
       autoInstallOnAppQuit: autoUpdater.autoInstallOnAppQuit

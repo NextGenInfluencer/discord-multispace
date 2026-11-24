@@ -779,12 +779,23 @@ function updateThemeUI() {
 // Account Persistence, Sidebar Rendering & Switching
 // ==========================================================================
 function saveAccounts() {
-  localStorage.setItem(STORAGE_ACCOUNTS_KEY, JSON.stringify(accounts));
+  try {
+    localStorage.setItem(STORAGE_ACCOUNTS_KEY, JSON.stringify(accounts));
+    return true;
+  } catch (err) {
+    console.warn('Failed to persist accounts to localStorage:', err);
+    showToast('Storage quota exceeded — could not persist account changes.', true);
+    return false;
+  }
 }
 
 function saveActiveAccountId(id) {
   activeAccountId = id;
-  localStorage.setItem(STORAGE_ACTIVE_ID_KEY, id);
+  try {
+    localStorage.setItem(STORAGE_ACTIVE_ID_KEY, id);
+  } catch (err) {
+    console.warn('Failed to persist active account ID to localStorage:', err);
+  }
 }
 
 function getInitials(name) {
@@ -964,6 +975,7 @@ function handleAvatarFile(file) {
   reader.onload = (e) => {
     const img = new Image();
     img.onload = () => {
+      if (!img.width || !img.height) return;
       const canvas = document.createElement('canvas');
       const size = 128;
       canvas.width = size;
@@ -973,7 +985,7 @@ function handleAvatarFile(file) {
       const sx = (img.width - minSide) / 2;
       const sy = (img.height - minSide) / 2;
       ctx.drawImage(img, sx, sy, minSide, minSide, 0, 0, size, size);
-      currentAvatarDataUrl = canvas.toDataURL('image/png');
+      currentAvatarDataUrl = canvas.toDataURL('image/webp', 0.85);
       updateModalAvatarPreview();
     };
     img.src = e.target.result;
@@ -1485,7 +1497,9 @@ async function populateStreamAudioDevices() {
 
 function handleStreamAudioDeviceSelection(newVal) {
   currentStreamAudioDevice = newVal || 'loopback';
-  localStorage.setItem(STORAGE_STREAM_AUDIO_DEVICE, currentStreamAudioDevice);
+  try {
+    localStorage.setItem(STORAGE_STREAM_AUDIO_DEVICE, currentStreamAudioDevice);
+  } catch {}
   if (selectStreamAudioSource) selectStreamAudioSource.value = currentStreamAudioDevice;
   if (screenPickerAudioDeviceSelect) screenPickerAudioDeviceSelect.value = currentStreamAudioDevice;
   eAPI.send('set-stream-audio-device', currentStreamAudioDevice);
@@ -1646,7 +1660,12 @@ function submitScreenPicker() {
 }
 
 eAPI.on('open-screen-picker', (data) => openScreenPicker(data));
-eAPI.on('cancel-screen-picker', () => closeScreenPicker(false));
+eAPI.on('cancel-screen-picker', (data) => {
+  if (data && data.requestId && currentScreenPickerRequestId && data.requestId !== currentScreenPickerRequestId) {
+    return;
+  }
+  closeScreenPicker(false);
+});
 
 // ==========================================================================
 // Event Listeners Wiring
@@ -1662,6 +1681,8 @@ window.addEventListener('click', (e) => {
 });
 
 window.addEventListener('keydown', (e) => {
+  if (e.isComposing || e.keyCode === 229) return;
+
   if (e.key === 'Escape') {
     closeContextMenu();
     closeReloadContextMenu();
@@ -1672,8 +1693,14 @@ window.addEventListener('keydown', (e) => {
     return;
   }
 
-  if (e.key === 'Enter') {
-    if (modalOverlay && modalOverlay.classList.contains('active') && document.activeElement !== btnModalCancel) {
+  if (e.key === 'Enter' && !e.isComposing) {
+    if (
+      modalOverlay &&
+      modalOverlay.classList.contains('active') &&
+      document.activeElement !== btnModalCancel &&
+      document.activeElement !== btnUploadAvatar &&
+      document.activeElement !== btnRemoveAvatar
+    ) {
       e.preventDefault();
       handleModalSubmit();
       return;
@@ -1683,7 +1710,12 @@ window.addEventListener('keydown', (e) => {
       confirmRemoveAccount();
       return;
     }
-    if (screenPickerModal && screenPickerModal.classList.contains('active')) {
+    if (
+      screenPickerModal &&
+      screenPickerModal.classList.contains('active') &&
+      document.activeElement !== btnScreenPickerCancel &&
+      document.activeElement !== btnScreenPickerCloseX
+    ) {
       e.preventDefault();
       submitScreenPicker();
       return;
@@ -1918,7 +1950,9 @@ if (settingsModalOverlay) {
 if (toggleMemorySaver) {
   toggleMemorySaver.addEventListener('change', async (e) => {
     memorySaverEnabled = e.target.checked;
-    localStorage.setItem('multispace_memory_saver', String(memorySaverEnabled));
+    try {
+      localStorage.setItem('multispace_memory_saver', String(memorySaverEnabled));
+    } catch {}
     if (!memorySaverEnabled) {
       Object.keys(accountHibernating).forEach((k) => delete accountHibernating[k]);
       await eAPI.invoke('views:check-hibernation', { idleAccountIds: [], memorySaverEnabled: false });
@@ -1946,7 +1980,9 @@ if (toggleGlobalShortcuts) {
 if (toggleShowReloadBtn) {
   toggleShowReloadBtn.addEventListener('change', (e) => {
     showReloadBtn = e.target.checked;
-    localStorage.setItem(STORAGE_SHOW_RELOAD_BTN_KEY, String(showReloadBtn));
+    try {
+      localStorage.setItem(STORAGE_SHOW_RELOAD_BTN_KEY, String(showReloadBtn));
+    } catch {}
     updateReloadButtonVisibility();
     showToast(showReloadBtn ? 'Reload button enabled' : 'Reload button hidden');
   });
@@ -2024,7 +2060,16 @@ eAPI.invoke('get-app-version').then((version) => {
   if (version && updaterVersionTag) updaterVersionTag.textContent = `v${version}`;
 }).catch(() => {});
 
+let availableUpdateInfo = null;
+let isUpdateDownloading = false;
+let isUpdateDownloaded = false;
+
 async function startExplicitUpdateDownload() {
+  if (availableUpdateInfo && availableUpdateInfo.isDev) {
+    eAPI.openExternal('https://github.com/NextGenInfluencer/discord-multispace/releases/latest');
+    return;
+  }
+  isUpdateDownloading = true;
   if (btnDownloadUpdate) {
     btnDownloadUpdate.disabled = true;
     btnDownloadUpdate.textContent = 'Downloading...';
@@ -2033,11 +2078,34 @@ async function startExplicitUpdateDownload() {
     btnBannerAction.disabled = true;
     btnBannerAction.textContent = 'Downloading...';
   }
+  if (updateBannerDesc) {
+    updateBannerDesc.textContent = 'Downloading update...';
+  }
   if (updaterStatusDot) updaterStatusDot.className = 'updater-dot downloading';
   if (updaterStatusText) updaterStatusText.textContent = 'Downloading update...';
   if (updaterProgressContainer) updaterProgressContainer.style.display = 'block';
   if (updaterProgressBar) updaterProgressBar.style.width = '0%';
-  await eAPI.invoke('updater:download');
+  const res = await eAPI.invoke('updater:download');
+  if (res && res.isDev) {
+    isUpdateDownloading = false;
+    if (updaterProgressContainer) updaterProgressContainer.style.display = 'none';
+    if (btnDownloadUpdate) {
+      btnDownloadUpdate.disabled = false;
+      btnDownloadUpdate.textContent = 'View Release';
+    }
+    if (btnBannerAction) {
+      btnBannerAction.disabled = false;
+      btnBannerAction.textContent = 'View Release';
+    }
+    if (updateBannerDesc) {
+      updateBannerDesc.textContent = 'A new release is available on GitHub.';
+    }
+    if (updaterStatusDot) updaterStatusDot.className = 'updater-dot available';
+    if (updaterStatusText) {
+      const v = availableUpdateInfo && availableUpdateInfo.version ? `v${availableUpdateInfo.version}` : 'New Release';
+      updaterStatusText.textContent = `Update available (${v})`;
+    }
+  }
 }
 
 if (btnCheckUpdates) {
@@ -2074,6 +2142,9 @@ eAPI.on('update-checking', () => {
 });
 
 eAPI.on('update-available', (info) => {
+  availableUpdateInfo = info || {};
+  isUpdateDownloading = false;
+  isUpdateDownloaded = false;
   const versionStr = info && info.version ? `v${info.version}` : 'New Release';
   if (updaterStatusDot) updaterStatusDot.className = 'updater-dot available';
   if (updaterStatusText) updaterStatusText.textContent = `Update available (${versionStr})`;
@@ -2112,6 +2183,8 @@ eAPI.on('update-available', (info) => {
 });
 
 eAPI.on('update-not-available', (info) => {
+  availableUpdateInfo = null;
+  isUpdateDownloading = false;
   if (updaterStatusDot) updaterStatusDot.className = 'updater-dot';
   if (updaterStatusText) updaterStatusText.textContent = 'Up to date';
   if (updaterSubtext) updaterSubtext.textContent = 'You are running the latest version of Discord MultiSpace.';
@@ -2128,6 +2201,7 @@ eAPI.on('update-not-available', (info) => {
 });
 
 eAPI.on('update-download-progress', (progress) => {
+  isUpdateDownloading = true;
   const pct = progress && progress.percent !== undefined ? Math.round(progress.percent) : 0;
   if (updaterStatusDot) updaterStatusDot.className = 'updater-dot downloading';
   if (updaterStatusText) updaterStatusText.textContent = `Downloading update (${pct}%)`;
@@ -2145,6 +2219,8 @@ eAPI.on('update-download-progress', (progress) => {
 });
 
 eAPI.on('update-downloaded', (info) => {
+  isUpdateDownloading = false;
+  isUpdateDownloaded = true;
   const versionStr = info && info.version ? `v${info.version}` : '';
   if (updaterStatusDot) updaterStatusDot.className = 'updater-dot ready';
   if (updaterStatusText) updaterStatusText.textContent = `Update ready to install! ${versionStr}`.trim();
@@ -2178,19 +2254,55 @@ eAPI.on('update-downloaded', (info) => {
 });
 
 eAPI.on('update-error', (err) => {
+  const wasDownloading = isUpdateDownloading;
+  isUpdateDownloading = false;
+
+  if (isUpdateDownloaded && (!err || !err.manual) && !wasDownloading) {
+    return;
+  }
+
   if (updaterStatusDot) updaterStatusDot.className = 'updater-dot error';
-  if (updaterStatusText) updaterStatusText.textContent = 'Update check failed';
-  if (updaterSubtext) updaterSubtext.textContent = (err && err.message) || 'Could not connect to update server.';
+  if (updaterStatusText) {
+    updaterStatusText.textContent = wasDownloading ? 'Update download failed' : 'Update check failed';
+  }
+  if (updaterSubtext) {
+    updaterSubtext.textContent =
+      (err && err.message) ||
+      (wasDownloading ? 'Could not download update. Click Download Update to try again.' : 'Could not connect to update server.');
+  }
+  if (updaterProgressContainer) updaterProgressContainer.style.display = 'none';
+  if (updaterProgressBar) updaterProgressBar.style.width = '0%';
+
+  const isDevRelease = Boolean(availableUpdateInfo && availableUpdateInfo.isDev);
   if (btnDownloadUpdate) {
     btnDownloadUpdate.disabled = false;
-    btnDownloadUpdate.textContent = 'Download Update';
+    btnDownloadUpdate.textContent = isDevRelease ? 'View Release' : 'Download Update';
   }
   if (btnCheckUpdates) {
     btnCheckUpdates.disabled = false;
     if (btnCheckUpdatesText) btnCheckUpdatesText.textContent = 'Check for Updates';
   }
-  if (err && err.manual) {
-    showToast((err && err.message) || 'Could not reach update server.', true);
+
+  if (!isUpdateDownloaded) {
+    if (btnBannerAction) {
+      btnBannerAction.disabled = false;
+      btnBannerAction.textContent = isDevRelease ? 'View Release' : 'Download Update';
+      btnBannerAction.onclick = isDevRelease
+        ? () => eAPI.openExternal('https://github.com/NextGenInfluencer/discord-multispace/releases/latest')
+        : startExplicitUpdateDownload;
+    }
+    if (updateBannerDesc) {
+      updateBannerDesc.textContent = wasDownloading
+        ? 'Download failed. Click Download Update to try again.'
+        : (isDevRelease ? 'A new release is available on GitHub.' : 'Download now to upgrade when ready.');
+    }
+    if (updateBanner && updateBanner.style.display !== 'none') {
+      pushLayoutToMain(false);
+    }
+  }
+
+  if ((err && err.manual) || wasDownloading) {
+    showToast((err && err.message) || (wasDownloading ? 'Update download failed.' : 'Could not reach update server.'), true);
   }
 });
 

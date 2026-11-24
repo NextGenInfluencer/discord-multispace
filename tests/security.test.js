@@ -22,7 +22,8 @@ const {
   classifyPopupRequest,
   matchAudioInputDevice,
   computePaneBounds,
-  parseDiscordTitleUnread
+  parseDiscordTitleUnread,
+  sanitizeWindowState
 } = require('../lib/security');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -432,4 +433,56 @@ test('Repository PII, bundled offline assets, CSP, and packaging hygiene checks'
   assert.ok(fs.statSync(path.join(ROOT_DIR, 'tray-icon.png')).size > 1000);
   assert.ok(fs.statSync(path.join(ROOT_DIR, 'assets', 'fonts', 'Inter-Variable.woff2')).size > 40000);
   assert.equal(fs.existsSync(path.join(ROOT_DIR, 'assets', 'fonts', 'Inter-Regular.woff2')), false);
+});
+
+test('Window bounds & maximized state persistence clamping across multi-monitor and off-screen layouts', () => {
+  const dualDisplays = [
+    { workArea: { x: 0, y: 0, width: 1920, height: 1040 } },
+    { workArea: { x: -1920, y: -200, width: 1920, height: 1040 } }
+  ];
+  const singleDisplay = [{ workArea: { x: 0, y: 0, width: 1920, height: 1040 } }];
+  const smallLaptopDisplay = [{ workArea: { x: 0, y: 0, width: 1024, height: 680 } }];
+  const defaults = { width: 1280, height: 800, minWidth: 940, minHeight: 560 };
+
+  // 1. Null / malformed inputs fall back to defaults without coordinates
+  for (const invalid of [null, undefined, 'corrupt', { width: NaN, height: -50, x: Infinity, y: 'bad' }]) {
+    const res = sanitizeWindowState(invalid, singleDisplay, defaults);
+    assert.deepEqual(res, { width: 1280, height: 800, isMaximized: false });
+  }
+
+  // 2. Below-minimum saved dimensions clamp up to minWidth / minHeight
+  assert.deepEqual(
+    sanitizeWindowState({ width: 320, height: 240, isMaximized: false }, singleDisplay, defaults),
+    { width: 940, height: 560, isMaximized: false }
+  );
+
+  // 3. Valid negative coordinates on secondary left/top monitor are preserved verbatim
+  assert.deepEqual(
+    sanitizeWindowState({ x: -1600, y: -120, width: 1280, height: 800, isMaximized: false }, dualDisplays, defaults),
+    { x: -1600, y: -120, width: 1280, height: 800, isMaximized: false }
+  );
+
+  // 4. Partially off-screen window pulls titlebar and overflowing right edge back inside display workArea
+  assert.deepEqual(
+    sanitizeWindowState({ x: 1500, y: -45, width: 1280, height: 800, isMaximized: false }, singleDisplay, defaults),
+    { x: 640, y: 0, width: 1280, height: 800, isMaximized: false }
+  );
+
+  // 5. Unplugged secondary monitor (0 overlap with remaining display) re-centers on primary display & preserves isMaximized
+  assert.deepEqual(
+    sanitizeWindowState({ x: 2600, y: 120, width: 1400, height: 900, isMaximized: true }, singleDisplay, defaults),
+    { x: 260, y: 70, width: 1400, height: 900, isMaximized: true }
+  );
+
+  // 6. Oversized 4K window restored onto a smaller laptop screen clamps to workArea
+  assert.deepEqual(
+    sanitizeWindowState({ x: 200, y: 200, width: 3840, height: 2160, isMaximized: false }, smallLaptopDisplay, defaults),
+    { x: 0, y: 0, width: 1024, height: 680, isMaximized: false }
+  );
+
+  // 7. Exact zero (0, 0) coordinates are preserved (never treated as falsy)
+  assert.deepEqual(
+    sanitizeWindowState({ x: 0, y: 0, width: 1280, height: 800, isMaximized: false }, singleDisplay, defaults),
+    { x: 0, y: 0, width: 1280, height: 800, isMaximized: false }
+  );
 });
